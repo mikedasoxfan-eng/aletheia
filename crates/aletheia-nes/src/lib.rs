@@ -6,7 +6,7 @@ pub use bus::{NesBus, PROGRAM_START, RESET_VECTOR};
 pub use cartridge::{
     CartridgeError as NesCartridgeError, CartridgeInfo as NesCartridgeInfo, MapperKind,
 };
-pub use cpu::{NesCpu, Registers, StepInfo};
+pub use cpu::{NesCpu, NesCpuError, Registers, StepInfo};
 
 use aletheia_core::{
     DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
@@ -23,6 +23,7 @@ pub struct NesCore {
     bus: NesBus,
     cycles_until_next_step: u8,
     input_mix: u8,
+    cpu_fault: Option<String>,
 }
 
 impl NesCore {
@@ -33,6 +34,10 @@ impl NesCore {
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<(), NesCartridgeError> {
         self.bus.load_cartridge(rom)?;
         Ok(())
+    }
+
+    pub fn cpu_fault(&self) -> Option<&str> {
+        self.cpu_fault.as_deref()
     }
 }
 
@@ -50,6 +55,7 @@ impl DeterministicMachine for NesCore {
         self.cpu.reset(&self.bus);
         self.cycles_until_next_step = 0;
         self.input_mix = 0;
+        self.cpu_fault = None;
     }
 
     fn tick(&mut self, cycle: u64, input_events: &[InputEvent]) -> (u8, i16) {
@@ -60,8 +66,17 @@ impl DeterministicMachine for NesCore {
         }
 
         if self.cycles_until_next_step == 0 {
-            let step = self.cpu.step(&mut self.bus);
-            self.cycles_until_next_step = step.cycles.saturating_sub(1);
+            if self.cpu_fault.is_none() {
+                match self.cpu.step(&mut self.bus) {
+                    Ok(step) => {
+                        self.cycles_until_next_step = step.cycles.saturating_sub(1);
+                    }
+                    Err(error) => {
+                        self.cpu_fault = Some(error.to_string());
+                        self.cycles_until_next_step = 0;
+                    }
+                }
+            }
         } else {
             self.cycles_until_next_step -= 1;
         }
@@ -85,6 +100,8 @@ pub enum NesRunError {
     Cartridge(#[from] NesCartridgeError),
     #[error("{0}")]
     Determinism(#[from] DeterminismError),
+    #[error("{0}")]
+    Cpu(String),
 }
 
 pub fn run_rom_digest(
@@ -94,7 +111,11 @@ pub fn run_rom_digest(
 ) -> Result<RunDigest, NesRunError> {
     let mut core = NesCore::default();
     core.load_rom(rom)?;
-    Ok(run_deterministic(&mut core, cycles, replay)?)
+    let digest = run_deterministic(&mut core, cycles, replay)?;
+    if let Some(fault) = core.cpu_fault() {
+        return Err(NesRunError::Cpu(fault.to_owned()));
+    }
+    Ok(digest)
 }
 
 #[cfg(test)]
@@ -164,5 +185,19 @@ mod tests {
         let digest = run_rom_digest(32, &replay, &rom).expect("rom run");
         assert_eq!(digest.system, SystemId::Nes);
         assert_eq!(digest.applied_events, 3);
+    }
+
+    #[test]
+    fn run_rom_digest_fails_on_unsupported_opcode() {
+        let replay = replay_fixture();
+        let mut rom = vec![0; 16 + (16 * 1024)];
+        rom[..4].copy_from_slice(b"NES\x1A");
+        rom[4] = 1;
+        rom[16] = 0x02; // unsupported
+        rom[16 + 0x3FFC] = 0x00;
+        rom[16 + 0x3FFD] = 0x80;
+
+        let error = run_rom_digest(8, &replay, &rom).expect_err("should fail");
+        assert!(matches!(error, NesRunError::Cpu(_)));
     }
 }

@@ -47,8 +47,11 @@ impl NesBus {
     }
 
     pub fn write8(&mut self, addr: u16, value: u8) {
-        if (0x8000..=0xFFFF).contains(&addr) && self.cartridge.is_some() {
-            return;
+        if let Some(cartridge) = &mut self.cartridge {
+            if (0x8000..=0xFFFF).contains(&addr) {
+                cartridge.cpu_write(addr, value);
+                return;
+            }
         }
         self.mem[addr as usize] = value;
     }
