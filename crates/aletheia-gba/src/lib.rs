@@ -566,6 +566,31 @@ impl GbaCore {
         }
     }
 
+    fn condition_holds(&self, cond: u32) -> bool {
+        let n = (self.cpsr & CPSR_N_BIT) != 0;
+        let z = (self.cpsr & CPSR_Z_BIT) != 0;
+        let c = (self.cpsr & CPSR_C_BIT) != 0;
+        let v = (self.cpsr & CPSR_V_BIT) != 0;
+        match cond {
+            0x0 => z,
+            0x1 => !z,
+            0x2 => c,
+            0x3 => !c,
+            0x4 => n,
+            0x5 => !n,
+            0x6 => v,
+            0x7 => !v,
+            0x8 => c && !z,
+            0x9 => !c || z,
+            0xA => n == v,
+            0xB => n != v,
+            0xC => !z && (n == v),
+            0xD => z || (n != v),
+            0xE => true,
+            _ => false,
+        }
+    }
+
     fn step(&mut self) -> Result<StepInfo, GbaCpuError> {
         if self.thumb_mode() {
             self.step_thumb()
@@ -580,8 +605,7 @@ impl GbaCore {
         self.gpr[15] = self.gpr[15].wrapping_add(4);
 
         let cond = (opcode >> 28) & 0xF;
-        if cond != 0xE {
-            // For now, only AL executes. Other conditions are treated as NOP to keep deterministic stepping.
+        if !self.condition_holds(cond) {
             return Ok(StepInfo {
                 opcode,
                 cycles: 1,
@@ -607,7 +631,10 @@ impl GbaCore {
             // B/BL
             let imm24 = opcode & 0x00FF_FFFF;
             let signed = ((imm24 << 8) as i32) >> 6;
-            self.gpr[15] = (self.gpr[15] as i32).wrapping_add(signed) as u32;
+            if (opcode & (1 << 24)) != 0 {
+                self.gpr[14] = self.gpr[15];
+            }
+            self.gpr[15] = (self.gpr[15] as i32).wrapping_add(4 + signed) as u32;
             return Ok(StepInfo {
                 opcode,
                 cycles: 3,
@@ -1383,5 +1410,34 @@ mod tests {
             }
         }
         assert!(observed_non_zero);
+    }
+
+    #[test]
+    fn arm_conditional_instruction_executes_when_flags_match() {
+        let mut core = GbaCore::default();
+        let mut rom = vec![0; 16];
+        rom[0..4].copy_from_slice(&0xE3A0_0001u32.to_le_bytes()); // MOV R0,#1
+        rom[4..8].copy_from_slice(&0xE350_0001u32.to_le_bytes()); // CMP R0,#1
+        rom[8..12].copy_from_slice(&0x03A0_1007u32.to_le_bytes()); // MOVEQ R1,#7
+        rom[12..16].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // B .
+        core.load_rom(&rom);
+
+        run_deterministic(&mut core, 8, &ReplayLog::new()).expect("run");
+        assert_eq!(core.gpr[1], 7);
+    }
+
+    #[test]
+    fn arm_bl_sets_link_register_and_branches_with_pipeline_offset() {
+        let mut core = GbaCore::default();
+        let mut rom = vec![0; 32];
+        rom[0..4].copy_from_slice(&0xEB00_0001u32.to_le_bytes()); // BL to 0x10
+        rom[4..8].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // B .
+        rom[16..20].copy_from_slice(&0xE3A0_0009u32.to_le_bytes()); // MOV R0,#9
+        rom[20..24].copy_from_slice(&0xE12F_FF1Eu32.to_le_bytes()); // BX LR
+        core.load_rom(&rom);
+
+        run_deterministic(&mut core, 10, &ReplayLog::new()).expect("run");
+        assert_eq!(core.gpr[0], 9);
+        assert_eq!(core.gpr[14], ROM_BASE + 4);
     }
 }
