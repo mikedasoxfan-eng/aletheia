@@ -38,15 +38,19 @@ Implemented today:
     - `.gbc`
     - `.nes` (iNES, NROM mapper path)
     - `.gba` (deterministic bootstrap core path)
-  - `compat` command for recursive directory compatibility runs.
-  - `diff-rom` command to compare local hashes against a reference JSON report.
+  - `compat` command for recursive directory compatibility runs, with `--jobs` parallel workers and optional per-ROM `--timeout-ms`.
+  - `diff-rom` command to compare local hashes against:
+    - a reference JSON report (`--reference-report`), or
+    - an external emulator executable (`--reference-exe`) that is auto-invoked.
+  - Mid-run deterministic checkpoint verification for `run-rom` via `--checkpoint-cycle`.
+  - Improved HTML reports with run metadata, timeout/checkpoint sections, and reference invocation details.
 - Unit tests covering instruction behavior, flags, reset/vector behavior, cycle counts, and determinism.
 
 ## Current ROM Testing Flow
 Use local files under `USER_SUPPLIED_ROMS/` and run the headless lab CLI:
 
 ```bash
-cargo run -p aletheia-lab-cli -- run-rom USER_SUPPLIED_ROMS/samples/demo.gb --cycles 100000 --output-dir lab-output/run-rom
+cargo run -p aletheia-lab-cli -- run-rom USER_SUPPLIED_ROMS/samples/demo.gb --cycles 100000 --checkpoint-cycle 50000 --output-dir lab-output/run-rom
 ```
 
 Artifacts produced:
@@ -57,8 +61,24 @@ Artifacts produced:
 Additional harness commands:
 
 ```bash
-cargo run -p aletheia-lab-cli -- compat USER_SUPPLIED_ROMS/samples --cycles 100000 --output-dir lab-output/compat
-cargo run -p aletheia-lab-cli -- diff-rom USER_SUPPLIED_ROMS/samples/demo.gba lab-output/run-rom-gba/run.json --cycles 1000 --output-dir lab-output/diff
+cargo run -p aletheia-lab-cli -- compat USER_SUPPLIED_ROMS/samples --cycles 100000 --jobs 4 --timeout-ms 10000 --output-dir lab-output/compat
+cargo run -p aletheia-lab-cli -- diff-rom USER_SUPPLIED_ROMS/samples/demo.gba --reference-report lab-output/run-rom-gba/run.json --cycles 1000 --output-dir lab-output/diff
+cargo run -p aletheia-lab-cli -- diff-rom USER_SUPPLIED_ROMS/samples/demo.gba --reference-exe target/debug/aletheia-lab-cli --reference-arg run-rom --reference-arg {rom} --reference-arg=--cycles --reference-arg {cycles} --reference-arg=--output-dir --reference-arg {output_dir} --cycles 1000 --output-dir lab-output/diff-external
+```
+
+## Windows Quickstart
+PowerShell command pattern:
+
+```powershell
+cargo run -p aletheia-lab-cli -- run-rom "C:\path\to\game.gba" --cycles 200000 --checkpoint-cycle 100000 --output-dir lab-output\gba-run
+```
+
+Open generated HTML reports on Windows:
+
+```powershell
+Start-Process (Resolve-Path .\lab-output\gba-run\run.html)
+Start-Process (Resolve-Path .\lab-output\compat\compat.html)
+Start-Process (Resolve-Path .\lab-output\diff\diff.html)
 ```
 
 Not implemented yet:

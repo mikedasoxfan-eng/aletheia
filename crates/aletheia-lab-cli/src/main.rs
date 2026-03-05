@@ -1,6 +1,6 @@
 use aletheia_core::{
-    InputButton, InputEvent, InputState, ReplayLog, RomError, RomFormat, RomImage, RunDigest,
-    load_rom_image,
+    CheckpointDigest, InputButton, InputEvent, InputState, ReplayLog, RomError, RomFormat,
+    RomImage, RunDigest, load_rom_image,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -8,6 +8,10 @@ use serde_json::Value;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -49,6 +53,8 @@ enum Commands {
         cycles: u64,
         #[arg(long)]
         replay: Option<PathBuf>,
+        #[arg(long)]
+        checkpoint_cycle: Option<u64>,
         #[arg(long, default_value = "lab-output/run-rom")]
         output_dir: PathBuf,
     },
@@ -59,13 +65,26 @@ enum Commands {
         cycles: u64,
         #[arg(long)]
         replay: Option<PathBuf>,
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
         #[arg(long, default_value = "lab-output/compat")]
         output_dir: PathBuf,
     },
     /// Compare Aletheia ROM output against a reference JSON report.
     DiffRom {
         rom: PathBuf,
-        reference_report: PathBuf,
+        #[arg(long)]
+        reference_report: Option<PathBuf>,
+        #[arg(long)]
+        reference_exe: Option<PathBuf>,
+        #[arg(long = "reference-arg")]
+        reference_args: Vec<String>,
+        #[arg(long)]
+        reference_output: Option<PathBuf>,
+        #[arg(long, default_value_t = 30_000)]
+        reference_timeout_ms: u64,
         #[arg(long, default_value_t = 100_000)]
         cycles: u64,
         #[arg(long)]
@@ -117,8 +136,10 @@ struct RunRomReport {
     rom: RomImage,
     cycles: u64,
     replay_events: usize,
+    checkpoint_cycle: Option<u64>,
     success: bool,
     digest: Option<RunDigest>,
+    checkpoint: Option<CheckpointDigest>,
     error: Option<String>,
 }
 
@@ -127,9 +148,12 @@ struct CompatReport {
     report_schema_version: u16,
     cycles: u64,
     replay_events: usize,
+    jobs: usize,
+    timeout_ms: Option<u64>,
     total: usize,
     passed: usize,
     failed: usize,
+    timed_out: usize,
     entries: Vec<CompatEntry>,
 }
 
@@ -138,6 +162,8 @@ struct CompatEntry {
     rom_path: String,
     rom_format: String,
     success: bool,
+    timed_out: bool,
+    elapsed_ms: u128,
     digest: Option<RunDigest>,
     error: Option<String>,
 }
@@ -160,9 +186,26 @@ struct DiffReport {
     local_digest: Option<RunDigest>,
     local_error: Option<String>,
     reference: ReferenceDigest,
+    reference_run: Option<ReferenceRunReport>,
     frame_match: bool,
     audio_match: bool,
     all_match: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ReferenceRunReport {
+    executable: String,
+    args: Vec<String>,
+    output_path: String,
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceRunConfig {
+    executable: PathBuf,
+    args: Vec<String>,
+    output: PathBuf,
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Error)]
@@ -183,8 +226,18 @@ enum CliError {
     RomRunFailed(String),
     #[error("compatibility run completed with {failed} failures")]
     CompatFailed { failed: usize },
+    #[error("compatibility worker thread panicked")]
+    CompatWorkerPanic,
+    #[error("ROM execution timed out for '{rom}' after {timeout_ms}ms")]
+    RomRunTimeout { rom: String, timeout_ms: u64 },
     #[error("failed to parse reference digest from '{path}'")]
     InvalidReferenceReport { path: String },
+    #[error("reference source not provided; use --reference-report or --reference-exe")]
+    MissingReferenceSource,
+    #[error("reference emulator process failed: {exe} (exit code {code})")]
+    ReferenceProcessFailed { exe: String, code: i32 },
+    #[error("reference emulator process timed out: {exe} after {timeout_ms}ms")]
+    ReferenceProcessTimedOut { exe: String, timeout_ms: u64 },
     #[error("diff mismatch for ROM '{rom}'")]
     DiffMismatch { rom: String },
 }
@@ -277,16 +330,45 @@ fn run() -> Result<(), CliError> {
             rom,
             cycles,
             replay,
+            checkpoint_cycle,
             output_dir,
         } => {
             fs::create_dir_all(&output_dir)?;
             let replay_log = load_replay(replay)?;
             let rom_image = load_rom_image(&rom)?;
 
-            let digest_result = run_detected_rom(&rom_image, cycles, &replay_log);
-            let (success, digest, error) = match digest_result {
-                Ok(digest) => (true, Some(digest), None),
-                Err(error) => (false, None, Some(error.to_string())),
+            let (success, digest, checkpoint, error) = match checkpoint_cycle {
+                Some(cycle) => {
+                    match run_detected_rom_with_checkpoint(&rom_image, cycles, &replay_log, cycle) {
+                        Ok(checkpoint_result) => {
+                            let success = checkpoint_result.digests_match;
+                            let error = if success {
+                                None
+                            } else {
+                                Some(format!(
+                                    "checkpoint replay mismatch at cycle {}",
+                                    checkpoint_result.checkpoint_cycle
+                                ))
+                            };
+                            (
+                                success,
+                                Some(checkpoint_result.baseline.clone()),
+                                Some(checkpoint_result),
+                                error,
+                            )
+                        }
+                        Err(error) => (
+                            false,
+                            None,
+                            None,
+                            Some(format!("checkpoint verification failed: {error}")),
+                        ),
+                    }
+                }
+                None => match run_detected_rom(&rom_image, cycles, &replay_log) {
+                    Ok(digest) => (true, Some(digest), None, None),
+                    Err(error) => (false, None, None, Some(error.to_string())),
+                },
             };
 
             let report = RunRomReport {
@@ -294,8 +376,10 @@ fn run() -> Result<(), CliError> {
                 rom: rom_image,
                 cycles,
                 replay_events: replay_log.events.len(),
+                checkpoint_cycle,
                 success,
                 digest,
+                checkpoint,
                 error,
             };
 
@@ -321,61 +405,32 @@ fn run() -> Result<(), CliError> {
             rom_dir,
             cycles,
             replay,
+            jobs,
+            timeout_ms,
             output_dir,
         } => {
             fs::create_dir_all(&output_dir)?;
             let replay_log = load_replay(replay)?;
             let rom_paths = collect_supported_rom_paths(&rom_dir)?;
+            let jobs = jobs.max(1);
+            let mut entries =
+                run_compat_entries(rom_paths, cycles, replay_log.clone(), jobs, timeout_ms)?;
+            entries.sort_by(|a, b| a.rom_path.cmp(&b.rom_path));
 
-            let mut entries = Vec::with_capacity(rom_paths.len());
-            let mut passed = 0usize;
-            let mut failed = 0usize;
-
-            for rom_path in rom_paths {
-                let rom_path_str = rom_path.to_string_lossy().to_string();
-                match load_rom_image(&rom_path) {
-                    Ok(rom_image) => match run_detected_rom(&rom_image, cycles, &replay_log) {
-                        Ok(digest) => {
-                            passed += 1;
-                            entries.push(CompatEntry {
-                                rom_path: rom_path_str,
-                                rom_format: rom_image.format.as_label().to_owned(),
-                                success: true,
-                                digest: Some(digest),
-                                error: None,
-                            });
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            entries.push(CompatEntry {
-                                rom_path: rom_path_str,
-                                rom_format: rom_image.format.as_label().to_owned(),
-                                success: false,
-                                digest: None,
-                                error: Some(error.to_string()),
-                            });
-                        }
-                    },
-                    Err(error) => {
-                        failed += 1;
-                        entries.push(CompatEntry {
-                            rom_path: rom_path_str,
-                            rom_format: "unknown".to_owned(),
-                            success: false,
-                            digest: None,
-                            error: Some(error.to_string()),
-                        });
-                    }
-                }
-            }
+            let passed = entries.iter().filter(|entry| entry.success).count();
+            let failed = entries.len().saturating_sub(passed);
+            let timed_out = entries.iter().filter(|entry| entry.timed_out).count();
 
             let report = CompatReport {
                 report_schema_version: 1,
                 cycles,
                 replay_events: replay_log.events.len(),
+                jobs,
+                timeout_ms,
                 total: entries.len(),
                 passed,
                 failed,
+                timed_out,
                 entries,
             };
             let json = serde_json::to_string_pretty(&report)?;
@@ -396,6 +451,10 @@ fn run() -> Result<(), CliError> {
         Commands::DiffRom {
             rom,
             reference_report,
+            reference_exe,
+            reference_args,
+            reference_output,
+            reference_timeout_ms,
             cycles,
             replay,
             output_dir,
@@ -403,7 +462,16 @@ fn run() -> Result<(), CliError> {
             fs::create_dir_all(&output_dir)?;
             let replay_log = load_replay(replay)?;
             let rom_image = load_rom_image(&rom)?;
-            let reference = parse_reference_digest(&reference_report)?;
+            let (reference, reference_run) = load_reference_for_diff(
+                &rom,
+                cycles,
+                &output_dir,
+                reference_report,
+                reference_exe,
+                reference_args,
+                reference_output,
+                reference_timeout_ms,
+            )?;
 
             let local_run = run_detected_rom(&rom_image, cycles, &replay_log);
             let (local_success, local_digest, local_error) = match local_run {
@@ -430,6 +498,7 @@ fn run() -> Result<(), CliError> {
                 local_digest,
                 local_error,
                 reference,
+                reference_run,
                 frame_match,
                 audio_match,
                 all_match,
@@ -482,6 +551,280 @@ fn run_detected_rom(
             path: rom.path.clone(),
         }),
     }
+}
+
+fn run_detected_rom_with_checkpoint(
+    rom: &RomImage,
+    cycles: u64,
+    replay: &ReplayLog,
+    checkpoint_cycle: u64,
+) -> Result<CheckpointDigest, CliError> {
+    match rom.format {
+        RomFormat::Gb | RomFormat::Gbc => aletheia_gb::run_rom_digest_with_checkpoint(
+            cycles,
+            replay,
+            &rom.bytes,
+            checkpoint_cycle,
+        )
+        .map_err(|error| CliError::RomRunFailed(error.to_string())),
+        RomFormat::Nes => aletheia_nes::run_rom_digest_with_checkpoint(
+            cycles,
+            replay,
+            &rom.bytes,
+            checkpoint_cycle,
+        )
+        .map_err(|error| CliError::RomRunFailed(error.to_string())),
+        RomFormat::Gba => aletheia_gba::run_rom_digest_with_checkpoint(
+            cycles,
+            replay,
+            &rom.bytes,
+            checkpoint_cycle,
+        )
+        .map_err(|error| CliError::RomRunFailed(error.to_string())),
+        RomFormat::Unknown => Err(CliError::UnsupportedRomFormat {
+            path: rom.path.clone(),
+        }),
+    }
+}
+
+fn run_compat_entries(
+    rom_paths: Vec<PathBuf>,
+    cycles: u64,
+    replay_log: ReplayLog,
+    jobs: usize,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<CompatEntry>, CliError> {
+    if rom_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunk_size = ((rom_paths.len() + jobs.saturating_sub(1)) / jobs).max(1);
+    let mut entries = Vec::with_capacity(rom_paths.len());
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in rom_paths.chunks(chunk_size) {
+            let chunk_paths = chunk.to_vec();
+            let worker_replay = replay_log.clone();
+            handles.push(
+                scope.spawn(move || {
+                    run_compat_chunk(chunk_paths, cycles, worker_replay, timeout_ms)
+                }),
+            );
+        }
+
+        for handle in handles {
+            let mut chunk_entries = handle.join().map_err(|_| CliError::CompatWorkerPanic)?;
+            entries.append(&mut chunk_entries);
+        }
+
+        Ok::<(), CliError>(())
+    })?;
+
+    Ok(entries)
+}
+
+fn run_compat_chunk(
+    rom_paths: Vec<PathBuf>,
+    cycles: u64,
+    replay_log: ReplayLog,
+    timeout_ms: Option<u64>,
+) -> Vec<CompatEntry> {
+    rom_paths
+        .into_iter()
+        .map(|path| run_single_compat_entry(path, cycles, &replay_log, timeout_ms))
+        .collect()
+}
+
+fn run_single_compat_entry(
+    rom_path: PathBuf,
+    cycles: u64,
+    replay_log: &ReplayLog,
+    timeout_ms: Option<u64>,
+) -> CompatEntry {
+    let started = Instant::now();
+    let rom_path_str = rom_path.to_string_lossy().to_string();
+
+    match load_rom_image(&rom_path) {
+        Ok(rom_image) => {
+            let rom_format = rom_image.format.as_label().to_owned();
+            let run_result = match timeout_ms {
+                Some(timeout_ms) => run_detected_rom_with_timeout(
+                    rom_image.clone(),
+                    cycles,
+                    replay_log.clone(),
+                    timeout_ms,
+                ),
+                None => run_detected_rom(&rom_image, cycles, replay_log),
+            };
+
+            let elapsed_ms = started.elapsed().as_millis();
+            match run_result {
+                Ok(digest) => CompatEntry {
+                    rom_path: rom_path_str,
+                    rom_format,
+                    success: true,
+                    timed_out: false,
+                    elapsed_ms,
+                    digest: Some(digest),
+                    error: None,
+                },
+                Err(error) => CompatEntry {
+                    rom_path: rom_path_str,
+                    rom_format,
+                    success: false,
+                    timed_out: matches!(error, CliError::RomRunTimeout { .. }),
+                    elapsed_ms,
+                    digest: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        Err(error) => CompatEntry {
+            rom_path: rom_path_str,
+            rom_format: "unknown".to_owned(),
+            success: false,
+            timed_out: false,
+            elapsed_ms: started.elapsed().as_millis(),
+            digest: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn run_detected_rom_with_timeout(
+    rom: RomImage,
+    cycles: u64,
+    replay_log: ReplayLog,
+    timeout_ms: u64,
+) -> Result<RunDigest, CliError> {
+    let rom_path = rom.path.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = run_detected_rom(&rom, cycles, &replay_log).map_err(|error| error.to_string());
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(Ok(digest)) => Ok(digest),
+        Ok(Err(error)) => Err(CliError::RomRunFailed(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(CliError::RomRunTimeout {
+            rom: rom_path,
+            timeout_ms,
+        }),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(CliError::RomRunFailed("ROM worker disconnected".to_owned()))
+        }
+    }
+}
+
+fn load_reference_for_diff(
+    rom_path: &Path,
+    cycles: u64,
+    output_dir: &Path,
+    reference_report: Option<PathBuf>,
+    reference_exe: Option<PathBuf>,
+    reference_args: Vec<String>,
+    reference_output: Option<PathBuf>,
+    reference_timeout_ms: u64,
+) -> Result<(ReferenceDigest, Option<ReferenceRunReport>), CliError> {
+    if let Some(reference_exe) = reference_exe {
+        let default_output_dir = output_dir.join("reference");
+        let output_path = reference_output.unwrap_or_else(|| default_output_dir.join("run.json"));
+        let args = if reference_args.is_empty() {
+            vec![
+                "run-rom".to_owned(),
+                "{rom}".to_owned(),
+                "--cycles".to_owned(),
+                "{cycles}".to_owned(),
+                "--output-dir".to_owned(),
+                "{output_dir}".to_owned(),
+            ]
+        } else {
+            reference_args
+        };
+        let config = ReferenceRunConfig {
+            executable: reference_exe,
+            args,
+            output: output_path,
+            timeout_ms: reference_timeout_ms,
+        };
+        let run_report = run_reference_emulator(&config, rom_path, cycles)?;
+        let digest = parse_reference_digest(&config.output)?;
+        return Ok((digest, Some(run_report)));
+    }
+
+    if let Some(reference_report) = reference_report {
+        let digest = parse_reference_digest(&reference_report)?;
+        return Ok((digest, None));
+    }
+
+    Err(CliError::MissingReferenceSource)
+}
+
+fn run_reference_emulator(
+    config: &ReferenceRunConfig,
+    rom_path: &Path,
+    cycles: u64,
+) -> Result<ReferenceRunReport, CliError> {
+    if let Some(parent) = config.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let output_dir = config.output.parent().unwrap_or_else(|| Path::new("."));
+    let rendered_args = config
+        .args
+        .iter()
+        .map(|arg| render_reference_arg(arg, rom_path, cycles, &config.output, output_dir))
+        .collect::<Vec<_>>();
+
+    let mut child = Command::new(&config.executable)
+        .args(&rendered_args)
+        .spawn()?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(config.timeout_ms);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                break;
+            }
+            return Err(CliError::ReferenceProcessFailed {
+                exe: config.executable.to_string_lossy().to_string(),
+                code: status.code().unwrap_or(-1),
+            });
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CliError::ReferenceProcessTimedOut {
+                exe: config.executable.to_string_lossy().to_string(),
+                timeout_ms: config.timeout_ms,
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    Ok(ReferenceRunReport {
+        executable: config.executable.to_string_lossy().to_string(),
+        args: rendered_args,
+        output_path: config.output.to_string_lossy().to_string(),
+        timeout_ms: config.timeout_ms,
+    })
+}
+
+fn render_reference_arg(
+    template: &str,
+    rom_path: &Path,
+    cycles: u64,
+    output_path: &Path,
+    output_dir: &Path,
+) -> String {
+    template
+        .replace("{rom}", &rom_path.to_string_lossy())
+        .replace("{cycles}", &cycles.to_string())
+        .replace("{output}", &output_path.to_string_lossy())
+        .replace("{output_dir}", &output_dir.to_string_lossy())
 }
 
 fn parse_reference_digest(path: &Path) -> Result<ReferenceDigest, CliError> {
@@ -610,11 +953,19 @@ fn write_text_file(path: &Path, content: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn report_style() -> &'static str {
+    "body{font-family:'Segoe UI',Tahoma,Arial,sans-serif;margin:0;background:linear-gradient(180deg,#f5f8ff 0%,#eef2fb 100%);color:#16213a}main{max-width:1100px;margin:0 auto;padding:28px}h1{margin:0 0 8px 0;font-size:28px}p.meta{margin:0 0 20px 0;color:#31456e}.card{background:#fff;border:1px solid #d8e1f4;border-radius:12px;box-shadow:0 8px 28px rgba(20,35,70,.08);padding:16px 18px;margin-bottom:16px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #ebf0fb;text-align:left;vertical-align:top}th{color:#28406d;background:#f7f9ff}tr:hover td{background:#fbfcff}.ok{color:#0b6a3f;font-weight:600}.fail{color:#a01937;font-weight:600}code{font-family:'Cascadia Code','Consolas',monospace;font-size:12px;word-break:break-all}.kv{display:grid;grid-template-columns:180px 1fr;gap:6px 12px}.label{color:#51638d}"
+}
+
 fn render_suite_html(report: &SuiteReport) -> String {
     let mut rows = String::new();
 
     for entry in &report.entries {
-        let status = if entry.success { "PASS" } else { "FAIL" };
+        let status = if entry.success {
+            "<span class=\"ok\">PASS</span>"
+        } else {
+            "<span class=\"fail\">FAIL</span>"
+        };
         let (frame_hash, audio_hash, error) = if let Some(digest) = &entry.digest {
             (digest.frame_hash.as_str(), digest.audio_hash.as_str(), "")
         } else {
@@ -633,35 +984,62 @@ fn render_suite_html(report: &SuiteReport) -> String {
     }
 
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Suite Report</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia Deterministic Suite</h1>\n<p>Schema v{} | Cycles {}</p>\n<table>\n<thead><tr><th>System</th><th>Status</th><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody>\n{}\n</tbody>\n</table>\n</body>\n</html>\n",
-        report.report_schema_version, report.cycles, rows
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Suite Report</title>\n<style>{}</style>\n</head>\n<body>\n<main>\n<h1>Aletheia Deterministic Suite</h1>\n<p class=\"meta\">Schema v{} | Cycles {}</p>\n<section class=\"card\">\n<table>\n<thead><tr><th>System</th><th>Status</th><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody>\n{}\n</tbody>\n</table>\n</section>\n</main>\n</body>\n</html>\n",
+        report_style(),
+        report.report_schema_version,
+        report.cycles,
+        rows
     )
 }
 
 fn render_run_rom_html(report: &RunRomReport) -> String {
     let (status, frame_hash, audio_hash, error) = if let Some(digest) = &report.digest {
         (
-            "PASS",
+            "<span class=\"ok\">PASS</span>",
             digest.frame_hash.as_str(),
             digest.audio_hash.as_str(),
             "",
         )
     } else {
         (
-            "FAIL",
+            "<span class=\"fail\">FAIL</span>",
             "-",
             "-",
             report.error.as_deref().unwrap_or("unknown ROM run failure"),
         )
     };
+    let checkpoint_summary = match (&report.checkpoint_cycle, &report.checkpoint) {
+        (Some(cycle), Some(checkpoint)) => {
+            if checkpoint.digests_match {
+                format!(
+                    "<div class=\"kv\"><div class=\"label\">Checkpoint cycle</div><div>{}</div><div class=\"label\">Checkpoint replay</div><div><span class=\"ok\">MATCH</span></div></div>",
+                    cycle
+                )
+            } else {
+                format!(
+                    "<div class=\"kv\"><div class=\"label\">Checkpoint cycle</div><div>{}</div><div class=\"label\">Checkpoint replay</div><div><span class=\"fail\">MISMATCH</span></div></div>",
+                    cycle
+                )
+            }
+        }
+        (Some(cycle), None) => format!(
+            "<div class=\"kv\"><div class=\"label\">Checkpoint cycle</div><div>{}</div><div class=\"label\">Checkpoint replay</div><div><span class=\"fail\">FAILED</span></div></div>",
+            cycle
+        ),
+        _ => "<div class=\"kv\"><div class=\"label\">Checkpoint replay</div><div>disabled</div></div>"
+            .to_owned(),
+    };
 
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia ROM Run</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia ROM Run</h1>\n<p><strong>ROM:</strong> {}</p>\n<p><strong>Format:</strong> {} | <strong>Size:</strong> {} bytes | <strong>Cycles:</strong> {}</p>\n<p><strong>Status:</strong> {}</p>\n<table>\n<thead><tr><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody><tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr></tbody>\n</table>\n</body>\n</html>\n",
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia ROM Run</title>\n<style>{}</style>\n</head>\n<body>\n<main>\n<h1>Aletheia ROM Run</h1>\n<p class=\"meta\">Single-ROM deterministic execution summary</p>\n<section class=\"card\">\n<div class=\"kv\">\n<div class=\"label\">ROM path</div><div><code>{}</code></div>\n<div class=\"label\">Format</div><div>{}</div>\n<div class=\"label\">Size</div><div>{} bytes</div>\n<div class=\"label\">Cycles</div><div>{}</div>\n<div class=\"label\">Replay events</div><div>{}</div>\n<div class=\"label\">Status</div><div>{}</div>\n</div>\n</section>\n<section class=\"card\">{}</section>\n<section class=\"card\">\n<table>\n<thead><tr><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody><tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr></tbody>\n</table>\n</section>\n</main>\n</body>\n</html>\n",
+        report_style(),
         report.rom.path,
         report.rom.format.as_label(),
         report.rom.byte_len,
         report.cycles,
+        report.replay_events,
         status,
+        checkpoint_summary,
         frame_hash,
         audio_hash,
         error
@@ -670,9 +1048,17 @@ fn render_run_rom_html(report: &RunRomReport) -> String {
 
 fn render_compat_html(report: &CompatReport) -> String {
     let mut rows = String::new();
+    let timeout_label = report
+        .timeout_ms
+        .map(|timeout| timeout.to_string())
+        .unwrap_or_else(|| "none".to_owned());
 
     for entry in &report.entries {
-        let status = if entry.success { "PASS" } else { "FAIL" };
+        let status = if entry.success {
+            "<span class=\"ok\">PASS</span>"
+        } else {
+            "<span class=\"fail\">FAIL</span>"
+        };
         let frame_hash = entry
             .digest
             .as_ref()
@@ -687,14 +1073,33 @@ fn render_compat_html(report: &CompatReport) -> String {
 
         let _ = writeln!(
             rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>",
-            entry.rom_path, entry.rom_format, status, frame_hash, audio_hash, error
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>",
+            entry.rom_path,
+            entry.rom_format,
+            status,
+            if entry.timed_out { "yes" } else { "no" },
+            frame_hash,
+            audio_hash,
+            if error.is_empty() {
+                format!("{} ms", entry.elapsed_ms)
+            } else {
+                format!("{} ({} ms)", error, entry.elapsed_ms)
+            }
         );
     }
 
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Compatibility Report</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia Compatibility Report</h1>\n<p>Cycles {} | Replay events {} | Total {} | Passed {} | Failed {}</p>\n<table>\n<thead><tr><th>ROM</th><th>Format</th><th>Status</th><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody>\n{}\n</tbody>\n</table>\n</body>\n</html>\n",
-        report.cycles, report.replay_events, report.total, report.passed, report.failed, rows
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Compatibility Report</title>\n<style>{}</style>\n</head>\n<body>\n<main>\n<h1>Aletheia Compatibility Report</h1>\n<p class=\"meta\">Cycles {} | Replay events {} | Jobs {} | Timeout {}</p>\n<section class=\"card\">\n<div class=\"kv\">\n<div class=\"label\">Total ROMs</div><div>{}</div>\n<div class=\"label\">Passed</div><div>{}</div>\n<div class=\"label\">Failed</div><div>{}</div>\n<div class=\"label\">Timed out</div><div>{}</div>\n</div>\n</section>\n<section class=\"card\">\n<table>\n<thead><tr><th>ROM</th><th>Format</th><th>Status</th><th>Timed Out</th><th>Frame Hash</th><th>Audio Hash</th><th>Error / Elapsed</th></tr></thead>\n<tbody>\n{}\n</tbody>\n</table>\n</section>\n</main>\n</body>\n</html>\n",
+        report_style(),
+        report.cycles,
+        report.replay_events,
+        report.jobs,
+        timeout_label,
+        report.total,
+        report.passed,
+        report.failed,
+        report.timed_out,
+        rows
     )
 }
 
@@ -709,12 +1114,28 @@ fn render_diff_html(report: &DiffReport) -> String {
         .as_ref()
         .map(|digest| digest.audio_hash.as_str())
         .unwrap_or("-");
+    let status = if report.all_match {
+        "<span class=\"ok\">MATCH</span>"
+    } else {
+        "<span class=\"fail\">MISMATCH</span>"
+    };
+    let reference_run = report.reference_run.as_ref().map(|run| {
+        format!(
+            "<section class=\"card\"><div class=\"kv\"><div class=\"label\">Reference executable</div><div><code>{}</code></div><div class=\"label\">Rendered args</div><div><code>{}</code></div><div class=\"label\">Output report</div><div><code>{}</code></div><div class=\"label\">Timeout</div><div>{} ms</div></div></section>",
+            run.executable,
+            run.args.join(" "),
+            run.output_path,
+            run.timeout_ms
+        )
+    }).unwrap_or_default();
 
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Diff Report</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia Differential Report</h1>\n<p><strong>ROM:</strong> {} | <strong>Format:</strong> {} | <strong>All Match:</strong> {}</p>\n<table>\n<thead><tr><th>Source</th><th>Frame Hash</th><th>Audio Hash</th></tr></thead>\n<tbody>\n<tr><td>Aletheia</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n<tr><td>Reference ({})</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n</tbody>\n</table>\n<p>Frame Match: {} | Audio Match: {}</p>\n<p>{}</p>\n</body>\n</html>\n",
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Diff Report</title>\n<style>{}</style>\n</head>\n<body>\n<main>\n<h1>Aletheia Differential Report</h1>\n<p class=\"meta\">ROM <code>{}</code> | Format {} | Result {}</p>\n{}\n<section class=\"card\">\n<table>\n<thead><tr><th>Source</th><th>Frame Hash</th><th>Audio Hash</th></tr></thead>\n<tbody>\n<tr><td>Aletheia</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n<tr><td>Reference (<code>{}</code>)</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n</tbody>\n</table>\n</section>\n<section class=\"card\">\n<div class=\"kv\"><div class=\"label\">Frame Match</div><div>{}</div><div class=\"label\">Audio Match</div><div>{}</div><div class=\"label\">Local Error</div><div>{}</div></div>\n</section>\n</main>\n</body>\n</html>\n",
+        report_style(),
         report.rom.path,
         report.rom.format.as_label(),
-        report.all_match,
+        status,
+        reference_run,
         local_frame,
         local_audio,
         report.reference.source_path,
@@ -801,6 +1222,7 @@ mod tests {
             },
             cycles: 64,
             replay_events: 0,
+            checkpoint_cycle: None,
             success: true,
             digest: Some(RunDigest {
                 schema_version: 1,
@@ -811,6 +1233,7 @@ mod tests {
                 frame_hash: "ff".to_owned(),
                 audio_hash: "aa".to_owned(),
             }),
+            checkpoint: None,
             error: None,
         };
 
@@ -859,5 +1282,39 @@ mod tests {
         assert!(is_supported_rom_extension(Path::new("a.gb")));
         assert!(is_supported_rom_extension(Path::new("a.GBA")));
         assert!(!is_supported_rom_extension(Path::new("a.txt")));
+    }
+
+    #[test]
+    fn reference_arg_templates_are_rendered() {
+        let rom = Path::new("C:/roms/game.gba");
+        let output = Path::new("C:/tmp/ref/run.json");
+        let output_dir = Path::new("C:/tmp/ref");
+        let rendered = render_reference_arg(
+            "run {rom} --cycles {cycles} --out {output} --dir {output_dir}",
+            rom,
+            1234,
+            output,
+            output_dir,
+        );
+        assert!(rendered.contains("C:/roms/game.gba"));
+        assert!(rendered.contains("1234"));
+        assert!(rendered.contains("C:/tmp/ref/run.json"));
+        assert!(rendered.contains("C:/tmp/ref"));
+    }
+
+    #[test]
+    fn diff_requires_reference_source() {
+        let error = load_reference_for_diff(
+            Path::new("test.gba"),
+            100,
+            Path::new("lab-output/diff"),
+            None,
+            None,
+            vec![],
+            None,
+            2000,
+        )
+        .expect_err("missing reference source should fail");
+        assert!(matches!(error, CliError::MissingReferenceSource));
     }
 }

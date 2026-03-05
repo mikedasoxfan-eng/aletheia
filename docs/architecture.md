@@ -11,7 +11,13 @@ Build cycle-driven, deterministic emulation cores with shared replay/hash infras
 ## Determinism Guardrails
 - No wall-clock dependence in core code.
 - Replay logs are versioned, sortable, and serialized.
-- Save states will be versioned and tied to replay compatibility constraints.
+- Mid-run deterministic checkpoint verification is available in the lab runner (`--checkpoint-cycle`) and compares full baseline vs resumed digests.
+- Save-state schema remains versioned work-in-progress and is tied to replay compatibility constraints.
+
+## Lab Harness Notes
+- `compat` supports parallel workers (`--jobs`) and optional per-ROM timeout controls (`--timeout-ms`) for large ROM sets.
+- `diff-rom` can either consume a JSON report (`--reference-report`) or auto-run an external reference executable (`--reference-exe` + `--reference-arg` placeholders).
+- HTML reports are generated alongside JSON artifacts for visual triage on local machines (including Windows PowerShell workflows).
 
 ## Expansion Plan
 1. Establish deterministic run contract and smoke harness.
