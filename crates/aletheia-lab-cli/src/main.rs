@@ -261,8 +261,6 @@ enum CliError {
     ReferenceProcessFailed { exe: String, code: i32 },
     #[error("reference emulator process timed out: {exe} after {timeout_ms}ms")]
     ReferenceProcessTimedOut { exe: String, timeout_ms: u64 },
-    #[error("built-in live playback is diagnostic-only; pass --reference-exe for playable video/audio or --diagnostic-preview for sample output")]
-    LivePlayableNotImplemented,
     #[error("live playback failed: {0}")]
     LivePlayback(String),
     #[error("diff mismatch for ROM '{rom}'")]
@@ -441,7 +439,7 @@ fn run() -> Result<(), CliError> {
         } => {
             if let Some(reference_exe) = reference_exe {
                 run_external_live_playback(&rom, reference_exe, reference_args)?;
-            } else if diagnostic_preview {
+            } else {
                 let rom_image = load_rom_image(&rom)?;
                 run_live_playback(
                     rom_image,
@@ -450,9 +448,8 @@ fn run() -> Result<(), CliError> {
                     cycles_per_frame,
                     max_cycles,
                     no_audio,
+                    diagnostic_preview,
                 )?;
-            } else {
-                return Err(CliError::LivePlayableNotImplemented);
             }
         }
         Commands::Compat {
@@ -673,6 +670,25 @@ impl LiveCore {
             Self::Gba(core) => core.tick(cycle, input_events),
         }
     }
+
+    fn prefers_native_video(&self) -> bool {
+        matches!(self, Self::Gba(_))
+    }
+
+    fn copy_native_video(&self, buffer: &mut [u32]) -> bool {
+        match self {
+            Self::Gba(core) => {
+                let source = core.frame_buffer_argb();
+                if source.len() == buffer.len() {
+                    buffer.copy_from_slice(source);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 fn run_live_playback(
@@ -682,6 +698,7 @@ fn run_live_playback(
     cycles_per_frame: Option<u64>,
     max_cycles: Option<u64>,
     no_audio: bool,
+    diagnostic_preview: bool,
 ) -> Result<(), CliError> {
     let fps = fps.max(1);
     let profile = live_profile_for_format(rom.format)?;
@@ -691,9 +708,15 @@ fn run_live_playback(
     let mut core = create_live_core(&rom)?;
     core.reset();
 
+    let use_synthetic_video = diagnostic_preview || !core.prefers_native_video();
     let mut window = Window::new(
         &format!(
-            "Aletheia Diagnostic Preview [{}] - ESC quit, P pause",
+            "Aletheia {} [{}] - ESC quit, P pause",
+            if use_synthetic_video {
+                "Diagnostic Preview"
+            } else {
+                "Internal Live"
+            },
             profile.label.to_uppercase()
         ),
         profile.width,
@@ -753,8 +776,11 @@ fn run_live_playback(
                     &[] as &[InputEvent]
                 };
                 let (frame_sample, audio_sample) = core.tick(cycle, input_events);
-                let pixel_index = (cycle as usize) % frame_buffer.len();
-                frame_buffer[pixel_index] = colorize_live_sample(frame_sample, audio_sample, cycle);
+                if use_synthetic_video {
+                    let pixel_index = (cycle as usize) % frame_buffer.len();
+                    frame_buffer[pixel_index] =
+                        colorize_live_sample(frame_sample, audio_sample, cycle);
+                }
 
                 if audio_stream.is_some() {
                     audio_phase_accumulator += sample_rate as u64;
@@ -766,6 +792,10 @@ fn run_live_playback(
             }
             total_cycles += cycles_per_frame;
             frame_counter = frame_counter.wrapping_add(1);
+
+            if !use_synthetic_video {
+                let _ = core.copy_native_video(&mut frame_buffer);
+            }
 
             if let Some((_, sink)) = audio_stream.as_mut() {
                 if !queued_audio.is_empty() {
@@ -781,7 +811,12 @@ fn run_live_playback(
         if title_update_counter >= fps {
             let pause_label = if paused { " (paused)" } else { "" };
             window.set_title(&format!(
-                "Aletheia Diagnostic Preview [{}] cycles={} frames={}{}",
+                "Aletheia {} [{}] cycles={} frames={}{}",
+                if use_synthetic_video {
+                    "Diagnostic Preview"
+                } else {
+                    "Internal Live"
+                },
                 profile.label.to_uppercase(),
                 total_cycles,
                 frame_counter,
@@ -819,8 +854,13 @@ fn run_external_live_playback(
     } else {
         args.iter()
             .map(|arg| {
-                arg.replace("{rom}", &rom_path.to_string_lossy())
-                    .replace("{rom_dir}", &rom_path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy())
+                arg.replace("{rom}", &rom_path.to_string_lossy()).replace(
+                    "{rom_dir}",
+                    &rom_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .to_string_lossy(),
+                )
             })
             .collect::<Vec<_>>()
     };

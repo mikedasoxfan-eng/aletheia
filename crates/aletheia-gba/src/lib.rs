@@ -1,12 +1,27 @@
 use aletheia_core::{
-    CheckpointDigest, DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest,
-    SystemId, run_deterministic, run_deterministic_with_checkpoint,
+    CheckpointDigest, DeterminismError, DeterministicMachine, InputButton, InputEvent, InputState,
+    ReplayLog, RunDigest, SystemId, run_deterministic, run_deterministic_with_checkpoint,
 };
 use thiserror::Error;
 
 const ROM_BASE: u32 = 0x0800_0000;
 const WRAM_BASE: u32 = 0x0200_0000;
+const IO_BASE: u32 = 0x0400_0000;
+const PALETTE_BASE: u32 = 0x0500_0000;
+const VRAM_BASE: u32 = 0x0600_0000;
+const OAM_BASE: u32 = 0x0700_0000;
 const WRAM_SIZE: usize = 0x40000;
+const IO_SIZE: usize = 0x400;
+const PALETTE_SIZE: usize = 0x400;
+const VRAM_SIZE: usize = 0x18000;
+const OAM_SIZE: usize = 0x400;
+const GBA_WIDTH: usize = 240;
+const GBA_HEIGHT: usize = 160;
+const CYCLES_PER_PIXEL: u16 = 4;
+const VISIBLE_DOTS: u16 = (GBA_WIDTH as u16) * CYCLES_PER_PIXEL;
+const DOTS_PER_LINE: u16 = 1232;
+const LINES_PER_FRAME: u16 = 228;
+const VISIBLE_LINES: u16 = GBA_HEIGHT as u16;
 const CPSR_T_BIT: u32 = 1 << 5;
 const CPSR_N_BIT: u32 = 1 << 31;
 const CPSR_Z_BIT: u32 = 1 << 30;
@@ -43,6 +58,10 @@ pub enum GbaCpuError {
 pub struct GbaBus {
     rom: Vec<u8>,
     wram: Vec<u8>,
+    io: Vec<u8>,
+    palette: Vec<u8>,
+    vram: Vec<u8>,
+    oam: Vec<u8>,
 }
 
 impl GbaBus {
@@ -50,7 +69,21 @@ impl GbaBus {
         Self {
             rom: rom.to_vec(),
             wram: vec![0; WRAM_SIZE],
+            io: vec![0; IO_SIZE],
+            palette: vec![0; PALETTE_SIZE],
+            vram: vec![0; VRAM_SIZE],
+            oam: vec![0; OAM_SIZE],
         }
+    }
+
+    fn reset_runtime(&mut self) {
+        self.wram.fill(0);
+        self.io.fill(0);
+        self.palette.fill(0);
+        self.vram.fill(0);
+        self.oam.fill(0);
+        // DISPCNT defaults to forced blank disabled, mode 0.
+        self.write16(IO_BASE, 0x0000);
     }
 
     fn read8(&self, addr: u32) -> u8 {
@@ -63,16 +96,59 @@ impl GbaBus {
                 let offset = addr.wrapping_sub(WRAM_BASE) as usize;
                 self.wram.get(offset).copied().unwrap_or(0)
             }
+            IO_BASE..=0x0400_03FF => {
+                let offset = addr.wrapping_sub(IO_BASE) as usize;
+                self.io.get(offset).copied().unwrap_or(0)
+            }
+            PALETTE_BASE..=0x0500_03FF => {
+                let offset = addr.wrapping_sub(PALETTE_BASE) as usize;
+                self.palette.get(offset).copied().unwrap_or(0)
+            }
+            VRAM_BASE..=0x0601_7FFF => {
+                let offset = addr.wrapping_sub(VRAM_BASE) as usize;
+                self.vram.get(offset).copied().unwrap_or(0)
+            }
+            OAM_BASE..=0x0700_03FF => {
+                let offset = addr.wrapping_sub(OAM_BASE) as usize;
+                self.oam.get(offset).copied().unwrap_or(0)
+            }
             _ => 0,
         }
     }
 
     fn write8(&mut self, addr: u32, value: u8) {
-        if let WRAM_BASE..=0x0203_FFFF = addr {
-            let offset = addr.wrapping_sub(WRAM_BASE) as usize;
-            if let Some(slot) = self.wram.get_mut(offset) {
-                *slot = value;
+        match addr {
+            WRAM_BASE..=0x0203_FFFF => {
+                let offset = addr.wrapping_sub(WRAM_BASE) as usize;
+                if let Some(slot) = self.wram.get_mut(offset) {
+                    *slot = value;
+                }
             }
+            IO_BASE..=0x0400_03FF => {
+                let offset = addr.wrapping_sub(IO_BASE) as usize;
+                if let Some(slot) = self.io.get_mut(offset) {
+                    *slot = value;
+                }
+            }
+            PALETTE_BASE..=0x0500_03FF => {
+                let offset = addr.wrapping_sub(PALETTE_BASE) as usize;
+                if let Some(slot) = self.palette.get_mut(offset) {
+                    *slot = value;
+                }
+            }
+            VRAM_BASE..=0x0601_7FFF => {
+                let offset = addr.wrapping_sub(VRAM_BASE) as usize;
+                if let Some(slot) = self.vram.get_mut(offset) {
+                    *slot = value;
+                }
+            }
+            OAM_BASE..=0x0700_03FF => {
+                let offset = addr.wrapping_sub(OAM_BASE) as usize;
+                if let Some(slot) = self.oam.get_mut(offset) {
+                    *slot = value;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -106,8 +182,155 @@ impl GbaBus {
 }
 
 #[derive(Debug, Clone)]
+struct GbaPpu {
+    framebuffer: Vec<u32>,
+    line_cycle: u16,
+    scanline: u16,
+    frames: u64,
+}
+
+impl Default for GbaPpu {
+    fn default() -> Self {
+        Self {
+            framebuffer: vec![0xFF00_0000; GBA_WIDTH * GBA_HEIGHT],
+            line_cycle: 0,
+            scanline: 0,
+            frames: 0,
+        }
+    }
+}
+
+impl GbaPpu {
+    fn reset(&mut self) {
+        self.framebuffer.fill(0xFF00_0000);
+        self.line_cycle = 0;
+        self.scanline = 0;
+        self.frames = 0;
+    }
+
+    fn tick(&mut self, bus: &mut GbaBus) {
+        self.update_vcount(bus);
+        if self.scanline < VISIBLE_LINES
+            && self.line_cycle < VISIBLE_DOTS
+            && (self.line_cycle % CYCLES_PER_PIXEL) == 0
+        {
+            let x = (self.line_cycle / CYCLES_PER_PIXEL) as usize;
+            let y = self.scanline as usize;
+            self.framebuffer[y * GBA_WIDTH + x] = self.render_pixel(bus, x, y);
+        }
+
+        self.line_cycle = self.line_cycle.wrapping_add(1);
+        if self.line_cycle >= DOTS_PER_LINE {
+            self.line_cycle = 0;
+            self.scanline = self.scanline.wrapping_add(1);
+            if self.scanline >= LINES_PER_FRAME {
+                self.scanline = 0;
+                self.frames = self.frames.wrapping_add(1);
+            }
+            self.update_vcount(bus);
+        }
+    }
+
+    fn render_pixel(&self, bus: &GbaBus, x: usize, y: usize) -> u32 {
+        let dispcnt = bus.read16(IO_BASE);
+        let mode = dispcnt & 0x0007;
+        match mode {
+            3 => {
+                let offset = ((y * GBA_WIDTH) + x) * 2;
+                if offset + 1 < bus.vram.len() {
+                    let color = u16::from_le_bytes([bus.vram[offset], bus.vram[offset + 1]]);
+                    bgr555_to_argb8888(color)
+                } else {
+                    0xFF00_0000
+                }
+            }
+            4 => {
+                let frame_base = if (dispcnt & (1 << 4)) != 0 { 0xA000 } else { 0 };
+                let index_offset = frame_base + (y * GBA_WIDTH + x);
+                if index_offset < bus.vram.len() {
+                    let palette_index = bus.vram[index_offset] as usize * 2;
+                    if palette_index + 1 < bus.palette.len() {
+                        let color = u16::from_le_bytes([
+                            bus.palette[palette_index],
+                            bus.palette[palette_index + 1],
+                        ]);
+                        bgr555_to_argb8888(color)
+                    } else {
+                        0xFF00_0000
+                    }
+                } else {
+                    0xFF00_0000
+                }
+            }
+            _ => 0xFF00_0000,
+        }
+    }
+
+    fn update_vcount(&self, bus: &mut GbaBus) {
+        bus.write16(IO_BASE + 0x0006, self.scanline);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GbaApu {
+    phase: f32,
+    last_sample: i16,
+}
+
+impl Default for GbaApu {
+    fn default() -> Self {
+        Self {
+            phase: 0.0,
+            last_sample: 0,
+        }
+    }
+}
+
+impl GbaApu {
+    fn reset(&mut self) {
+        self.phase = 0.0;
+        self.last_sample = 0;
+    }
+
+    fn tick(&mut self, bus: &GbaBus, input_mix: u32) -> i16 {
+        // Keep output silent unless master sound is enabled.
+        let soundcnt_x = bus.read16(IO_BASE + 0x0084);
+        if (soundcnt_x & 0x0080) == 0 {
+            self.last_sample = 0;
+            return 0;
+        }
+
+        // Bootstrap tone model driven by sound regs; deterministic and controllable.
+        let sound1_freq = bus.read16(IO_BASE + 0x0064) & 0x07FF;
+        let sound1_env = bus.read16(IO_BASE + 0x0062);
+        let base_hz = 131_072.0 / (2048.0 - (sound1_freq as f32).max(1.0));
+        let volume = (((sound1_env >> 12) & 0x0F) as f32 / 15.0).max(0.05);
+        let mixed_hz = (base_hz + (input_mix as f32 % 53.0)).clamp(32.0, 20_000.0);
+        self.phase += mixed_hz / 16_777_216.0;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+        let amp = (volume * 12_000.0) as i16;
+        self.last_sample = if self.phase < 0.5 { amp } else { -amp };
+        self.last_sample
+    }
+}
+
+fn bgr555_to_argb8888(color: u16) -> u32 {
+    let r5 = (color & 0x1F) as u32;
+    let g5 = ((color >> 5) & 0x1F) as u32;
+    let b5 = ((color >> 10) & 0x1F) as u32;
+    let r8 = (r5 << 3) | (r5 >> 2);
+    let g8 = (g5 << 3) | (g5 >> 2);
+    let b8 = (b5 << 3) | (b5 >> 2);
+    0xFF00_0000 | (r8 << 16) | (g8 << 8) | b8
+}
+
+#[derive(Debug, Clone)]
 pub struct GbaCore {
     bus: GbaBus,
+    ppu: GbaPpu,
+    apu: GbaApu,
     gpr: [u32; 16],
     cpsr: u32,
     boot_thumb: bool,
@@ -119,6 +342,8 @@ impl Default for GbaCore {
     fn default() -> Self {
         Self {
             bus: GbaBus::with_rom(&[]),
+            ppu: GbaPpu::default(),
+            apu: GbaApu::default(),
             gpr: [0; 16],
             cpsr: 0x6000_001F,
             boot_thumb: false,
@@ -131,6 +356,8 @@ impl Default for GbaCore {
 impl GbaCore {
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.bus = GbaBus::with_rom(rom);
+        self.ppu.reset();
+        self.apu.reset();
     }
 
     pub fn regs(&self) -> Registers {
@@ -153,13 +380,48 @@ impl GbaCore {
         self.boot_thumb = enabled;
     }
 
+    pub fn frame_buffer_argb(&self) -> &[u32] {
+        &self.ppu.framebuffer
+    }
+
     fn reset_state(&mut self) {
+        self.bus.reset_runtime();
+        self.ppu.reset();
+        self.apu.reset();
+        self.bus.write16(IO_BASE + 0x0130, 0x03FF);
         self.gpr = [0; 16];
         self.gpr[15] = ROM_BASE;
         self.cpsr = 0x6000_001F;
         self.set_thumb_mode(self.boot_thumb);
         self.input_mix = 0;
         self.fault = None;
+    }
+
+    fn apply_input_events(&mut self, cycle: u64, input_events: &[InputEvent]) {
+        let mut keyinput = self.bus.read16(IO_BASE + 0x0130);
+        for event in input_events {
+            let mix =
+                ((event.port as u32) << 16) | ((event.button as u32) << 8) | event.state as u32;
+            self.input_mix = self.input_mix.rotate_left(3) ^ mix ^ cycle as u32;
+
+            let bit = match event.button {
+                InputButton::A => 0,
+                InputButton::B => 1,
+                InputButton::Select => 2,
+                InputButton::Start => 3,
+                InputButton::Right => 4,
+                InputButton::Left => 5,
+                InputButton::Up => 6,
+                InputButton::Down => 7,
+            };
+
+            if matches!(event.state, InputState::Pressed) {
+                keyinput &= !(1 << bit);
+            } else {
+                keyinput |= 1 << bit;
+            }
+        }
+        self.bus.write16(IO_BASE + 0x0130, keyinput);
     }
 
     fn thumb_mode(&self) -> bool {
@@ -786,11 +1048,7 @@ impl DeterministicMachine for GbaCore {
     }
 
     fn tick(&mut self, cycle: u64, input_events: &[InputEvent]) -> (u8, i16) {
-        for event in input_events {
-            let mix =
-                ((event.port as u32) << 16) | ((event.button as u32) << 8) | event.state as u32;
-            self.input_mix = self.input_mix.rotate_left(3) ^ mix ^ cycle as u32;
-        }
+        self.apply_input_events(cycle, input_events);
 
         if self.fault.is_none() {
             if let Err(error) = self.step() {
@@ -798,12 +1056,10 @@ impl DeterministicMachine for GbaCore {
             }
         }
 
-        let frame = (self.gpr[0] as u8) ^ (self.gpr[15] as u8) ^ (self.input_mix as u8);
-        let audio = ((self.gpr[0] as i32)
-            ^ ((self.gpr[1] as i32) << 1)
-            ^ ((self.gpr[15] as i32) >> 2)
-            ^ ((self.cpsr as i32) >> 8)
-            ^ ((self.input_mix as i32) << 1)) as i16;
+        self.ppu.tick(&mut self.bus);
+        let audio = self.apu.tick(&self.bus, self.input_mix);
+        let video_index = (cycle as usize) % self.ppu.framebuffer.len();
+        let frame = (self.ppu.framebuffer[video_index] & 0xFF) as u8;
         (frame, audio)
     }
 }
@@ -932,5 +1188,66 @@ mod tests {
 
         let error = run_rom_digest(2, &replay, &rom).expect_err("should fail");
         assert!(matches!(error, GbaRunError::Cpu(_)));
+    }
+
+    #[test]
+    fn mode3_framebuffer_updates_visible_pixel() {
+        let mut core = GbaCore::default();
+        core.load_rom(&[0; 4]);
+        core.reset_state();
+        core.bus.write16(IO_BASE, 0x0003); // mode 3
+        core.bus.write16(VRAM_BASE, 0x001F); // red
+
+        for cycle in 0..8u64 {
+            let _ = core.tick(cycle, &[]);
+        }
+
+        assert_eq!(core.frame_buffer_argb()[0], 0xFFFF_0000);
+    }
+
+    #[test]
+    fn keyinput_register_tracks_press_and_release() {
+        let mut core = GbaCore::default();
+        core.load_rom(&[0; 4]);
+        core.reset_state();
+        assert_eq!(core.bus.read16(IO_BASE + 0x0130) & 0x0001, 0x0001);
+
+        let press = [InputEvent {
+            cycle: 0,
+            port: 0,
+            button: InputButton::A,
+            state: InputState::Pressed,
+        }];
+        let release = [InputEvent {
+            cycle: 1,
+            port: 0,
+            button: InputButton::A,
+            state: InputState::Released,
+        }];
+
+        let _ = core.tick(0, &press);
+        assert_eq!(core.bus.read16(IO_BASE + 0x0130) & 0x0001, 0x0000);
+        let _ = core.tick(1, &release);
+        assert_eq!(core.bus.read16(IO_BASE + 0x0130) & 0x0001, 0x0001);
+    }
+
+    #[test]
+    fn apu_outputs_non_zero_when_master_enabled() {
+        let mut core = GbaCore::default();
+        core.load_rom(&[0; 4]);
+        core.reset_state();
+        core.bus.write16(IO_BASE + 0x0084, 0x0080); // SOUNDCNT_X master enable
+        core.bus.write16(IO_BASE + 0x0062, 0xF000); // envelope volume
+        core.bus.write16(IO_BASE + 0x0064, 0x0400); // frequency
+
+        let mut observed_non_zero = false;
+        for cycle in 0..256u64 {
+            let (_, sample) = core.tick(cycle, &[]);
+            if sample != 0 {
+                observed_non_zero = true;
+                break;
+            }
+        }
+        assert!(observed_non_zero);
     }
 }

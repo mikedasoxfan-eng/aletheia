@@ -19,6 +19,12 @@ Build cycle-driven, deterministic emulation cores with shared replay/hash infras
 - `diff-rom` can either consume a JSON report (`--reference-report`) or auto-run an external reference executable (`--reference-exe` + `--reference-arg` placeholders).
 - HTML reports are generated alongside JSON artifacts for visual triage on local machines (including Windows PowerShell workflows).
 
+## Current GBA AV Slice
+- The GBA core now includes explicit bus-backed VRAM/palette/OAM/IO regions.
+- A bootstrap PPU path advances scanline timing and renders mode 3/4 pixels to a 240x160 framebuffer.
+- A bootstrap APU path reads sound-control registers and emits deterministic samples when master sound is enabled.
+- `play-rom` default live mode now uses this internal framebuffer/audio path (still pre-fidelity relative to hardware).
+
 ## Expansion Plan
 1. Establish deterministic run contract and smoke harness.
 2. Land minimal CPU+bus execution for GB and NES with instruction tests.
