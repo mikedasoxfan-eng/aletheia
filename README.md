@@ -20,4 +20,19 @@ Aletheia is an accuracy-first emulator platform and regression lab for 80s/90s g
 - `USER_SUPPLIED_ROMS/`: ignored local ROM/test binaries.
 
 ## Current Status
-This repository is currently in bootstrap phase. The first slices establish deterministic execution contracts, artifact formats, and test harness plumbing before subsystem fidelity work.
+Implemented today:
+- Deterministic replay contract (`ReplayLog`) with canonical event ordering.
+- Stable run digests with frame/audio hashes for fixed `(system, replay, cycles)`.
+- Minimal executable CPU verticals:
+  - GB: `NOP`, `LD A,d8`, `INC A`, `DEC A`, `XOR A`.
+  - NES: `NOP`, `LDA #imm`, `TAX`, `INX`, `DEX`.
+- Headless lab CLI:
+  - `smoke` command for single-system JSON output.
+  - `suite` command for multi-system `summary.json` + `summary.html`.
+- Unit tests covering instruction behavior, flags, reset/vector behavior, cycle counts, and determinism.
+
+Not implemented yet:
+- Full CPU coverage and cycle-accurate timing behavior.
+- PPU/APU, interrupts, timers, DMA, mappers/MBCs.
+- Save-state schema and deterministic replay checkpoints.
+- Differential harness against external reference emulators.
