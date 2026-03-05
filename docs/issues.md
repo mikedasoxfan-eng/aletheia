@@ -8,3 +8,6 @@
 6. Expand GB opcode coverage and add table-driven instruction tests.
 7. Expand NES opcode coverage and define behavior for unsupported opcodes in strict mode.
 8. Add structured failure artifacts (trace + replay snapshot) to suite output folders.
+9. Implement GB MBC3 RTC semantics and battery-backed RAM handling.
+10. Implement NES mapper expansion (MMC1, UxROM, CNROM) from failing ROM compatibility cases.
+11. Expand GBA core beyond bootstrap subset (THUMB decode, interrupt model, timers).

@@ -27,6 +27,17 @@
   - `aletheia-gb` and `aletheia-nes` deterministic placeholder cores.
   - `aletheia-lab-cli` smoke command.
 
+## Slice 2B: ROM File Runner + GBA Bootstrap Path
+- Acceptance criteria:
+  - CLI can auto-detect and run `.gb`, `.gbc`, `.nes`, `.gba` files headlessly.
+  - ROM-run command emits deterministic `run.json`, `run.html`, and replay trace artifacts.
+  - GB/NES load from cartridge bytes instead of hardcoded boot snippets only.
+- Artifacts:
+  - ROM metadata loader in `aletheia-core`.
+  - Cartridge modules for GB and NES.
+  - `aletheia-gba` bootstrap deterministic core.
+  - `aletheia-lab-cli run-rom` command.
+
 ## Slice 3: First Real CPU Verticals
 - Acceptance criteria:
   - GB CPU executes a small instruction subset with flag-accurate unit tests.

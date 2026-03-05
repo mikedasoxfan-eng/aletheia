@@ -29,7 +29,24 @@ Implemented today:
 - Headless lab CLI:
   - `smoke` command for single-system JSON output.
   - `suite` command for multi-system `summary.json` + `summary.html`.
+  - `run-rom` command for user ROM files with auto-detect support for:
+    - `.gb`
+    - `.gbc`
+    - `.nes` (iNES, NROM mapper path)
+    - `.gba` (deterministic bootstrap core path)
 - Unit tests covering instruction behavior, flags, reset/vector behavior, cycle counts, and determinism.
+
+## Current ROM Testing Flow
+Use local files under `USER_SUPPLIED_ROMS/` and run the headless lab CLI:
+
+```bash
+cargo run -p aletheia-lab-cli -- run-rom USER_SUPPLIED_ROMS/samples/demo.gb --cycles 100000 --output-dir lab-output/run-rom
+```
+
+Artifacts produced:
+- `run.json` (machine-readable summary with ROM metadata and hashes)
+- `run.html` (human-readable report)
+- `replay.trace.txt` (canonical replay event trace)
 
 Not implemented yet:
 - Full CPU coverage and cycle-accurate timing behavior.
