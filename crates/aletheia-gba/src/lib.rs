@@ -82,6 +82,12 @@ impl GbaBus {
         u16::from_le_bytes([b0, b1])
     }
 
+    pub fn write16(&mut self, addr: u32, value: u16) {
+        let bytes = value.to_le_bytes();
+        self.write8(addr, bytes[0]);
+        self.write8(addr.wrapping_add(1), bytes[1]);
+    }
+
     pub fn read32(&self, addr: u32) -> u32 {
         let b0 = self.read8(addr);
         let b1 = self.read8(addr.wrapping_add(1));
@@ -235,11 +241,67 @@ impl GbaCore {
             return self.step_arm_data_processing(pc, opcode);
         }
 
+        if (opcode & 0x0F00_0000) == 0x0F00_0000 {
+            return self.step_arm_swi(pc, opcode);
+        }
+
         if (opcode & 0x0C00_0000) == 0x0400_0000 {
             return self.step_arm_load_store(pc, opcode);
         }
 
+        if (opcode & 0x0E00_0000) == 0x0800_0000 {
+            return self.step_arm_block_transfer(pc, opcode);
+        }
+
         Err(GbaCpuError::UnsupportedArm { opcode, pc })
+    }
+
+    fn step_arm_swi(&mut self, pc: u32, opcode: u32) -> Result<StepInfo, GbaCpuError> {
+        let swi_raw = opcode & 0x00FF_FFFF;
+        let swi = if (swi_raw & 0xFFFF) == 0 {
+            (swi_raw >> 16) & 0xFF
+        } else {
+            swi_raw & 0xFF
+        };
+        match swi {
+            0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 => {
+                // soft reset / ram reset / halt / stop / intrwait stubs
+            }
+            0x06 | 0x07 => {
+                // Div / DivArm
+                let numerator = self.gpr[0] as i32;
+                let denominator = self.gpr[1] as i32;
+                if denominator != 0 {
+                    let quotient = numerator.wrapping_div(denominator);
+                    let remainder = numerator.wrapping_rem(denominator);
+                    self.gpr[0] = quotient as u32;
+                    self.gpr[1] = remainder as u32;
+                    self.gpr[3] = quotient.unsigned_abs();
+                }
+            }
+            0x08 => {
+                // Sqrt
+                self.gpr[0] = (self.gpr[0] as f64).sqrt() as u32;
+            }
+            0x0B => {
+                self.cpu_set(false);
+            }
+            0x0C => {
+                self.cpu_set(true);
+            }
+            0x11 => {
+                self.lz77_uncomp_wram()?;
+            }
+            _ => {
+                return Err(GbaCpuError::UnsupportedArm { opcode, pc });
+            }
+        }
+
+        Ok(StepInfo {
+            opcode,
+            cycles: 4,
+            thumb: false,
+        })
     }
 
     fn step_arm_data_processing(&mut self, pc: u32, opcode: u32) -> Result<StepInfo, GbaCpuError> {
@@ -292,6 +354,18 @@ impl GbaCore {
                     }
                 }
             }
+            0x3 => {
+                let (result, borrow) = operand2.overflowing_sub(self.gpr[rn]);
+                self.gpr[rd] = result;
+                if set_flags {
+                    self.set_nz(result);
+                    if !borrow {
+                        self.cpsr |= CPSR_C_BIT;
+                    } else {
+                        self.cpsr &= !CPSR_C_BIT;
+                    }
+                }
+            }
             0x4 => {
                 let (result, carry) = self.gpr[rn].overflowing_add(operand2);
                 self.gpr[rd] = result;
@@ -310,10 +384,27 @@ impl GbaCore {
                     }
                 }
             }
+            0x8 => {
+                let result = self.gpr[rn] & operand2;
+                self.set_nz(result);
+            }
+            0x9 => {
+                let result = self.gpr[rn] ^ operand2;
+                self.set_nz(result);
+            }
             0xA => {
                 let (result, borrow) = self.gpr[rn].overflowing_sub(operand2);
                 self.set_nz(result);
                 if !borrow {
+                    self.cpsr |= CPSR_C_BIT;
+                } else {
+                    self.cpsr &= !CPSR_C_BIT;
+                }
+            }
+            0xB => {
+                let (result, carry) = self.gpr[rn].overflowing_add(operand2);
+                self.set_nz(result);
+                if carry {
                     self.cpsr |= CPSR_C_BIT;
                 } else {
                     self.cpsr &= !CPSR_C_BIT;
@@ -328,6 +419,18 @@ impl GbaCore {
             0xD => {
                 self.gpr[rd] = operand2;
                 if set_flags || immediate {
+                    self.set_nz(self.gpr[rd]);
+                }
+            }
+            0xE => {
+                self.gpr[rd] = self.gpr[rn] & !operand2;
+                if set_flags {
+                    self.set_nz(self.gpr[rd]);
+                }
+            }
+            0xF => {
+                self.gpr[rd] = !operand2;
+                if set_flags {
                     self.set_nz(self.gpr[rd]);
                 }
             }
@@ -351,32 +454,115 @@ impl GbaCore {
         let load = (opcode & (1 << 20)) != 0;
         let rn = ((opcode >> 16) & 0xF) as usize;
         let rd = ((opcode >> 12) & 0xF) as usize;
-
-        if byte || !pre_index || writeback {
+        let immediate_offset = (opcode & (1 << 25)) == 0;
+        if !immediate_offset {
             return Err(GbaCpuError::UnsupportedArm { opcode, pc });
         }
 
         let offset = opcode & 0xFFF;
         let base = self.gpr[rn];
-        let addr = if add {
-            base.wrapping_add(offset)
-        } else {
-            base.wrapping_sub(offset)
+        let apply_offset = |addr: u32| -> u32 {
+            if add {
+                addr.wrapping_add(offset)
+            } else {
+                addr.wrapping_sub(offset)
+            }
         };
 
+        let addr = if pre_index { apply_offset(base) } else { base };
+
         if load {
-            self.gpr[rd] = self.bus.read32(addr);
+            self.gpr[rd] = if byte {
+                self.bus.read8(addr) as u32
+            } else {
+                self.bus.read32(addr)
+            };
             if rd == 15 {
                 self.gpr[15] &= !1;
                 self.set_thumb_mode(false);
             }
         } else {
-            self.bus.write32(addr, self.gpr[rd]);
+            let value = if rd == 15 {
+                self.gpr[15].wrapping_add(4)
+            } else {
+                self.gpr[rd]
+            };
+            if byte {
+                self.bus.write8(addr, value as u8);
+            } else {
+                self.bus.write32(addr, value);
+            }
+        }
+
+        if !pre_index || writeback {
+            self.gpr[rn] = apply_offset(base);
         }
 
         Ok(StepInfo {
             opcode,
             cycles: 2,
+            thumb: false,
+        })
+    }
+
+    fn step_arm_block_transfer(&mut self, pc: u32, opcode: u32) -> Result<StepInfo, GbaCpuError> {
+        let pre = (opcode & (1 << 24)) != 0;
+        let up = (opcode & (1 << 23)) != 0;
+        let s = (opcode & (1 << 22)) != 0;
+        let writeback = (opcode & (1 << 21)) != 0;
+        let load = (opcode & (1 << 20)) != 0;
+        let rn = ((opcode >> 16) & 0xF) as usize;
+        let reg_list = opcode & 0xFFFF;
+
+        if s || reg_list == 0 {
+            return Err(GbaCpuError::UnsupportedArm { opcode, pc });
+        }
+
+        let reg_count = reg_list.count_ones();
+        let transfer_bytes = reg_count * 4;
+        let base = self.gpr[rn];
+        let start_addr = match (pre, up) {
+            (false, true) => base,
+            (true, true) => base.wrapping_add(4),
+            (false, false) => base.wrapping_sub(transfer_bytes).wrapping_add(4),
+            (true, false) => base.wrapping_sub(transfer_bytes),
+        };
+
+        let mut addr = start_addr;
+        for reg in 0..16usize {
+            if (reg_list & (1 << reg)) == 0 {
+                continue;
+            }
+
+            if load {
+                let value = self.bus.read32(addr);
+                self.gpr[reg] = value;
+                if reg == 15 {
+                    self.gpr[15] &= !1;
+                    self.set_thumb_mode(false);
+                }
+            } else {
+                let value = if reg == 15 {
+                    self.gpr[15].wrapping_add(4)
+                } else {
+                    self.gpr[reg]
+                };
+                self.bus.write32(addr, value);
+            }
+            addr = addr.wrapping_add(4);
+        }
+
+        if writeback {
+            self.gpr[rn] = if up {
+                base.wrapping_add(transfer_bytes)
+            } else {
+                base.wrapping_sub(transfer_bytes)
+            };
+        }
+
+        Ok(StepInfo {
+            opcode,
+            cycles: (1 + reg_count) as u8,
             thumb: false,
         })
     }
@@ -478,7 +664,111 @@ impl GbaCore {
             });
         }
 
+        if (opcode & 0xFF00) == 0xDF00 {
+            // SWI nn in THUMB mode
+            let arm_swi = 0xEF00_0000 | (opcode as u32 & 0xFF);
+            return self.step_arm_swi(pc, arm_swi);
+        }
+
         Err(GbaCpuError::UnsupportedThumb { opcode, pc })
+    }
+
+    fn cpu_set(&mut self, fast: bool) {
+        let mut src = self.gpr[0];
+        let mut dst = self.gpr[1];
+        let cnt = self.gpr[2];
+        let fill = (cnt & (1 << 24)) != 0;
+        let units = (cnt & 0x1F_FFFF) as usize;
+        if units == 0 {
+            return;
+        }
+
+        let unit_size = if fast || (cnt & (1 << 26)) != 0 { 4 } else { 2 };
+        let mut fill_value32 = 0u32;
+        let mut fill_value16 = 0u16;
+        if fill {
+            if unit_size == 4 {
+                fill_value32 = self.bus.read32(src);
+            } else {
+                fill_value16 = self.bus.read16(src);
+            }
+        }
+
+        for _ in 0..units {
+            if unit_size == 4 {
+                let value = if fill {
+                    fill_value32
+                } else {
+                    let v = self.bus.read32(src);
+                    src = src.wrapping_add(4);
+                    v
+                };
+                self.bus.write32(dst, value);
+                dst = dst.wrapping_add(4);
+            } else {
+                let value = if fill {
+                    fill_value16
+                } else {
+                    let v = self.bus.read16(src);
+                    src = src.wrapping_add(2);
+                    v
+                };
+                self.bus.write16(dst, value);
+                dst = dst.wrapping_add(2);
+            }
+        }
+    }
+
+    fn lz77_uncomp_wram(&mut self) -> Result<(), GbaCpuError> {
+        let src_start = self.gpr[0];
+        let dst_start = self.gpr[1];
+        let header = self.bus.read32(src_start);
+        if (header & 0xFF) != 0x10 {
+            // If data is not in LZ77 format under the current memory model, treat as a no-op.
+            return Ok(());
+        }
+
+        let out_len = (header >> 8) as usize;
+        let mut src = src_start.wrapping_add(4);
+        let mut produced = 0usize;
+
+        while produced < out_len {
+            let flags = self.bus.read8(src);
+            src = src.wrapping_add(1);
+
+            for bit in 0..8 {
+                if produced >= out_len {
+                    break;
+                }
+
+                let is_compressed = (flags & (0x80 >> bit)) != 0;
+                if !is_compressed {
+                    let value = self.bus.read8(src);
+                    src = src.wrapping_add(1);
+                    self.bus.write8(dst_start.wrapping_add(produced as u32), value);
+                    produced += 1;
+                    continue;
+                }
+
+                let b1 = self.bus.read8(src);
+                let b2 = self.bus.read8(src.wrapping_add(1));
+                src = src.wrapping_add(2);
+                let length = ((b1 >> 4) as usize) + 3;
+                let disp = ((((b1 as usize) & 0x0F) << 8) | b2 as usize) + 1;
+
+                for _ in 0..length {
+                    if produced >= out_len {
+                        break;
+                    }
+                    let from = produced.saturating_sub(disp);
+                    let value = self.bus.read8(dst_start.wrapping_add(from as u32));
+                    self.bus.write8(dst_start.wrapping_add(produced as u32), value);
+                    produced += 1;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
