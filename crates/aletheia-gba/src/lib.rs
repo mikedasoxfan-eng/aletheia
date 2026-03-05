@@ -233,15 +233,19 @@ impl GbaPpu {
 
     fn render_pixel(&self, bus: &GbaBus, x: usize, y: usize) -> u32 {
         let dispcnt = bus.read16(IO_BASE);
+        if (dispcnt & (1 << 7)) != 0 {
+            return 0xFFFF_FFFF;
+        }
         let mode = dispcnt & 0x0007;
         match mode {
+            0 => self.render_mode0(bus, dispcnt, x, y),
             3 => {
                 let offset = ((y * GBA_WIDTH) + x) * 2;
                 if offset + 1 < bus.vram.len() {
                     let color = u16::from_le_bytes([bus.vram[offset], bus.vram[offset + 1]]);
                     bgr555_to_argb8888(color)
                 } else {
-                    0xFF00_0000
+                    self.backdrop_color(bus)
                 }
             }
             4 => {
@@ -256,18 +260,122 @@ impl GbaPpu {
                         ]);
                         bgr555_to_argb8888(color)
                     } else {
-                        0xFF00_0000
+                        self.backdrop_color(bus)
                     }
                 } else {
-                    0xFF00_0000
+                    self.backdrop_color(bus)
                 }
             }
-            _ => 0xFF00_0000,
+            _ => self.backdrop_color(bus),
         }
     }
 
     fn update_vcount(&self, bus: &mut GbaBus) {
         bus.write16(IO_BASE + 0x0006, self.scanline);
+    }
+
+    fn backdrop_color(&self, bus: &GbaBus) -> u32 {
+        let color = u16::from_le_bytes([bus.palette[0], bus.palette[1]]);
+        bgr555_to_argb8888(color)
+    }
+
+    fn render_mode0(&self, bus: &GbaBus, dispcnt: u16, x: usize, y: usize) -> u32 {
+        let mut best_color = None;
+        let mut best_priority = u16::MAX;
+        for bg_index in 0..4u16 {
+            if (dispcnt & (1 << (8 + bg_index))) == 0 {
+                continue;
+            }
+            let bgcnt = bus.read16(IO_BASE + 0x0008 + (bg_index * 2) as u32);
+            let priority = bgcnt & 0x3;
+            if priority > best_priority {
+                continue;
+            }
+            if let Some(color) = self.render_mode0_bg(bus, bg_index as usize, bgcnt, x, y) {
+                best_priority = priority;
+                best_color = Some(color);
+            }
+        }
+
+        best_color.unwrap_or_else(|| self.backdrop_color(bus))
+    }
+
+    fn render_mode0_bg(
+        &self,
+        bus: &GbaBus,
+        bg_index: usize,
+        bgcnt: u16,
+        x: usize,
+        y: usize,
+    ) -> Option<u32> {
+        let color_8bpp = (bgcnt & (1 << 7)) != 0;
+        let char_base = (((bgcnt >> 2) & 0x3) as usize) * 0x4000;
+        let screen_base = (((bgcnt >> 8) & 0x1F) as usize) * 0x800;
+        let bg_size = (bgcnt >> 14) & 0x3;
+        let (bg_width, bg_height) = match bg_size {
+            0 => (256, 256),
+            1 => (512, 256),
+            2 => (256, 512),
+            _ => (512, 512),
+        };
+
+        let hofs = bus.read16(IO_BASE + 0x0010 + (bg_index as u32) * 4) as usize;
+        let vofs = bus.read16(IO_BASE + 0x0012 + (bg_index as u32) * 4) as usize;
+        let sx = (x + hofs) % bg_width;
+        let sy = (y + vofs) % bg_height;
+        let tile_x = sx / 8;
+        let tile_y = sy / 8;
+        let tiles_per_row = bg_width / 8;
+        let map_index = tile_y * tiles_per_row + tile_x;
+        let map_addr = screen_base + (map_index * 2);
+        if map_addr + 1 >= bus.vram.len() {
+            return None;
+        }
+
+        let map_entry = u16::from_le_bytes([bus.vram[map_addr], bus.vram[map_addr + 1]]);
+        let tile_index = (map_entry & 0x03FF) as usize;
+        let hflip = (map_entry & (1 << 10)) != 0;
+        let vflip = (map_entry & (1 << 11)) != 0;
+        let palette_bank = ((map_entry >> 12) & 0xF) as usize;
+
+        let mut px = sx % 8;
+        let mut py = sy % 8;
+        if hflip {
+            px = 7 - px;
+        }
+        if vflip {
+            py = 7 - py;
+        }
+
+        let palette_index = if color_8bpp {
+            let tile_addr = char_base + tile_index * 64 + py * 8 + px;
+            if tile_addr >= bus.vram.len() {
+                return None;
+            }
+            bus.vram[tile_addr] as usize
+        } else {
+            let tile_addr = char_base + tile_index * 32 + py * 4 + (px / 2);
+            if tile_addr >= bus.vram.len() {
+                return None;
+            }
+            let packed = bus.vram[tile_addr];
+            let index = if (px & 1) == 0 {
+                packed & 0x0F
+            } else {
+                packed >> 4
+            } as usize;
+            (palette_bank * 16) + index
+        };
+
+        if palette_index == 0 {
+            return None;
+        }
+        let palette_addr = palette_index * 2;
+        if palette_addr + 1 >= bus.palette.len() {
+            return None;
+        }
+        let color = u16::from_le_bytes([bus.palette[palette_addr], bus.palette[palette_addr + 1]]);
+        Some(bgr555_to_argb8888(color))
     }
 }
 
@@ -382,6 +490,14 @@ impl GbaCore {
 
     pub fn frame_buffer_argb(&self) -> &[u32] {
         &self.ppu.framebuffer
+    }
+
+    pub fn non_black_pixel_count(&self) -> usize {
+        self.ppu
+            .framebuffer
+            .iter()
+            .filter(|pixel| (**pixel & 0x00FF_FFFF) != 0)
+            .count()
     }
 
     fn reset_state(&mut self) {
@@ -1197,6 +1313,24 @@ mod tests {
         core.reset_state();
         core.bus.write16(IO_BASE, 0x0003); // mode 3
         core.bus.write16(VRAM_BASE, 0x001F); // red
+
+        for cycle in 0..8u64 {
+            let _ = core.tick(cycle, &[]);
+        }
+
+        assert_eq!(core.frame_buffer_argb()[0], 0xFFFF_0000);
+    }
+
+    #[test]
+    fn mode0_bg0_tile_renders_palette_color() {
+        let mut core = GbaCore::default();
+        core.load_rom(&[0; 4]);
+        core.reset_state();
+        core.bus.write16(IO_BASE, 0x0100); // mode 0 + BG0 enable
+        core.bus.write16(IO_BASE + 0x0008, 0x0100); // BG0CNT: charblock 0/screenblock 1/4bpp
+        core.bus.write16(PALETTE_BASE + 0x0002, 0x001F); // palette index 1 -> red
+        core.bus.write16(VRAM_BASE + 0x0800, 0x0000); // map entry tile 0
+        core.bus.write8(VRAM_BASE + 0x0000, 0x01); // tile pixel (0,0) uses palette index 1
 
         for cycle in 0..8u64 {
             let _ = core.tick(cycle, &[]);

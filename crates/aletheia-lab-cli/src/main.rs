@@ -689,6 +689,13 @@ impl LiveCore {
             _ => false,
         }
     }
+
+    fn non_black_pixels(&self) -> Option<usize> {
+        match self {
+            Self::Gba(core) => Some(core.non_black_pixel_count()),
+            _ => None,
+        }
+    }
 }
 
 fn run_live_playback(
@@ -810,8 +817,16 @@ fn run_live_playback(
         title_update_counter = title_update_counter.wrapping_add(1);
         if title_update_counter >= fps {
             let pause_label = if paused { " (paused)" } else { "" };
+            let pixel_note = if use_synthetic_video {
+                String::new()
+            } else {
+                format!(
+                    " nonblack={}",
+                    core.non_black_pixels().unwrap_or_default()
+                )
+            };
             window.set_title(&format!(
-                "Aletheia {} [{}] cycles={} frames={}{}",
+                "Aletheia {} [{}] cycles={} frames={}{}{}",
                 if use_synthetic_video {
                     "Diagnostic Preview"
                 } else {
@@ -820,7 +835,8 @@ fn run_live_playback(
                 profile.label.to_uppercase(),
                 total_cycles,
                 frame_counter,
-                pause_label
+                pause_label,
+                pixel_note
             ));
             title_update_counter = 0;
         }
