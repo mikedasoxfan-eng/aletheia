@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 aletheia-core = { path = "../aletheia-core" }
+thiserror.workspace = true

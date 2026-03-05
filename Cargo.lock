@@ -16,6 +16,7 @@ name = "aletheia-gb"
 version = "0.1.0"
 dependencies = [
  "aletheia-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -36,6 +37,7 @@ name = "aletheia-nes"
 version = "0.1.0"
 dependencies = [
  "aletheia-core",
+ "thiserror",
 ]
 
 [[package]]

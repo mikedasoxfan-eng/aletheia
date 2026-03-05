@@ -1,39 +1,67 @@
 mod bus;
+mod cartridge;
 mod cpu;
 
 pub use bus::{GbBus, PROGRAM_START};
+pub use cartridge::{CartridgeError as GbCartridgeError, CartridgeInfo as GbCartridgeInfo, MbcKind};
 pub use cpu::{GbCpu, Registers, StepInfo};
 
 use aletheia_core::{
     DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
     run_deterministic,
 };
+use thiserror::Error;
 
 const BOOT_PROGRAM: [u8; 9] = [0x3E, 0x10, 0x3C, 0x3D, 0xAF, 0x3E, 0x42, 0x00, 0x00];
 const JOYPAD_REG: u16 = 0xFF00;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DmgCore {
     cpu: GbCpu,
     bus: GbBus,
     cycles_until_next_step: u8,
     input_mix: u8,
+    system_id: SystemId,
+}
+
+impl Default for DmgCore {
+    fn default() -> Self {
+        Self {
+            cpu: GbCpu::default(),
+            bus: GbBus::default(),
+            cycles_until_next_step: 0,
+            input_mix: 0,
+            system_id: SystemId::GbDmg,
+        }
+    }
 }
 
 impl DmgCore {
     pub fn cpu_regs(&self) -> Registers {
         self.cpu.regs()
     }
+
+    pub fn load_rom(&mut self, rom: &[u8]) -> Result<(), GbCartridgeError> {
+        self.bus.load_cartridge(rom)?;
+        self.system_id = match self.bus.cartridge_info().map(|info| info.cgb_flag) {
+            Some(0x80) | Some(0xC0) => SystemId::GbCgb,
+            _ => SystemId::GbDmg,
+        };
+        Ok(())
+    }
 }
 
 impl DeterministicMachine for DmgCore {
     fn system_id(&self) -> SystemId {
-        SystemId::GbDmg
+        self.system_id
     }
 
     fn reset(&mut self) {
-        self.bus.clear();
-        self.bus.load_program(PROGRAM_START, &BOOT_PROGRAM);
+        self.bus.clear_runtime();
+        if !self.bus.has_cartridge() {
+            self.bus.load_program(PROGRAM_START, &BOOT_PROGRAM);
+            self.system_id = SystemId::GbDmg;
+        }
         self.cpu.reset();
         self.cycles_until_next_step = 0;
         self.input_mix = 0;
@@ -64,6 +92,20 @@ impl DeterministicMachine for DmgCore {
 
 pub fn smoke_digest(cycles: u64, replay: &ReplayLog) -> Result<RunDigest, DeterminismError> {
     run_deterministic(&mut DmgCore::default(), cycles, replay)
+}
+
+#[derive(Debug, Error)]
+pub enum GbRunError {
+    #[error("{0}")]
+    Cartridge(#[from] GbCartridgeError),
+    #[error("{0}")]
+    Determinism(#[from] DeterminismError),
+}
+
+pub fn run_rom_digest(cycles: u64, replay: &ReplayLog, rom: &[u8]) -> Result<RunDigest, GbRunError> {
+    let mut core = DmgCore::default();
+    core.load_rom(rom)?;
+    Ok(run_deterministic(&mut core, cycles, replay)?)
 }
 
 #[cfg(test)]
@@ -112,5 +154,17 @@ mod tests {
         run_deterministic(&mut core, 40, &replay).expect("run should succeed");
         let regs = core.cpu_regs();
         assert_eq!(regs.a, 0x42);
+    }
+
+    #[test]
+    fn run_rom_digest_loads_cgb_rom_and_sets_system_id() {
+        let replay = replay_fixture();
+        let mut rom = vec![0; 0x8000];
+        rom[0x100] = 0x3E;
+        rom[0x101] = 0x99;
+        rom[0x143] = 0xC0; // CGB only
+        rom[0x147] = 0x00; // ROM only
+        let digest = run_rom_digest(16, &replay, &rom).expect("rom run");
+        assert_eq!(digest.system, SystemId::GbCgb);
     }
 }
