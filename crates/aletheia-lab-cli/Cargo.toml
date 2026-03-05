@@ -9,6 +9,8 @@ aletheia-gba = { path = "../aletheia-gba" }
 aletheia-gb = { path = "../aletheia-gb" }
 aletheia-nes = { path = "../aletheia-nes" }
 clap.workspace = true
+minifb = "0.27"
+rodio = "0.21"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

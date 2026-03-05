@@ -44,6 +44,7 @@ Implemented today:
     - an external emulator executable (`--reference-exe`) that is auto-invoked.
   - Mid-run deterministic checkpoint verification for `run-rom` via `--checkpoint-cycle`.
   - Improved HTML reports with run metadata, timeout/checkpoint sections, and reference invocation details.
+  - `play-rom` live mode with real-time frame window + audio playback from the deterministic core loop.
 - Unit tests covering instruction behavior, flags, reset/vector behavior, cycle counts, and determinism.
 
 ## Current ROM Testing Flow
@@ -64,6 +65,7 @@ Additional harness commands:
 cargo run -p aletheia-lab-cli -- compat USER_SUPPLIED_ROMS/samples --cycles 100000 --jobs 4 --timeout-ms 10000 --output-dir lab-output/compat
 cargo run -p aletheia-lab-cli -- diff-rom USER_SUPPLIED_ROMS/samples/demo.gba --reference-report lab-output/run-rom-gba/run.json --cycles 1000 --output-dir lab-output/diff
 cargo run -p aletheia-lab-cli -- diff-rom USER_SUPPLIED_ROMS/samples/demo.gba --reference-exe target/debug/aletheia-lab-cli --reference-arg run-rom --reference-arg {rom} --reference-arg=--cycles --reference-arg {cycles} --reference-arg=--output-dir --reference-arg {output_dir} --cycles 1000 --output-dir lab-output/diff-external
+cargo run -p aletheia-lab-cli -- play-rom USER_SUPPLIED_ROMS/samples/demo.gba --fps 60 --sample-rate 48000
 ```
 
 ## Windows Quickstart
@@ -79,7 +81,13 @@ Open generated HTML reports on Windows:
 Start-Process (Resolve-Path .\lab-output\gba-run\run.html)
 Start-Process (Resolve-Path .\lab-output\compat\compat.html)
 Start-Process (Resolve-Path .\lab-output\diff\diff.html)
+cargo run -p aletheia-lab-cli -- play-rom "C:\path\to\game.gba" --fps 60 --sample-rate 48000
 ```
+
+Live mode notes:
+- `Esc` quits, `P` pauses/resumes.
+- Input mapping: `Z/X/Enter/Space/Arrow keys`.
+- Current visuals/audio are deterministic core-driven preview output while full PPU/APU fidelity is still in progress.
 
 Not implemented yet:
 - Full CPU coverage and cycle-accurate timing behavior.

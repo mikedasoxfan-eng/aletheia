@@ -1,10 +1,13 @@
 use aletheia_core::{
-    CheckpointDigest, InputButton, InputEvent, InputState, ReplayLog, RomError, RomFormat,
-    RomImage, RunDigest, load_rom_image,
+    CheckpointDigest, DeterministicMachine, InputButton, InputEvent, InputState, ReplayLog,
+    RomError, RomFormat, RomImage, RunDigest, load_rom_image,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
+use rodio::{OutputStreamBuilder, Sink, buffer::SamplesBuffer};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,6 +60,20 @@ enum Commands {
         checkpoint_cycle: Option<u64>,
         #[arg(long, default_value = "lab-output/run-rom")]
         output_dir: PathBuf,
+    },
+    /// Run a ROM with live frame rendering and audible playback (developer preview).
+    PlayRom {
+        rom: PathBuf,
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+        #[arg(long, default_value_t = 48_000)]
+        sample_rate: u32,
+        #[arg(long)]
+        cycles_per_frame: Option<u64>,
+        #[arg(long)]
+        max_cycles: Option<u64>,
+        #[arg(long)]
+        no_audio: bool,
     },
     /// Run all supported ROM files in a directory tree and emit compatibility artifacts.
     Compat {
@@ -238,6 +255,8 @@ enum CliError {
     ReferenceProcessFailed { exe: String, code: i32 },
     #[error("reference emulator process timed out: {exe} after {timeout_ms}ms")]
     ReferenceProcessTimedOut { exe: String, timeout_ms: u64 },
+    #[error("live playback failed: {0}")]
+    LivePlayback(String),
     #[error("diff mismatch for ROM '{rom}'")]
     DiffMismatch { rom: String },
 }
@@ -400,6 +419,24 @@ fn run() -> Result<(), CliError> {
                         .to_owned(),
                 ));
             }
+        }
+        Commands::PlayRom {
+            rom,
+            fps,
+            sample_rate,
+            cycles_per_frame,
+            max_cycles,
+            no_audio,
+        } => {
+            let rom_image = load_rom_image(&rom)?;
+            run_live_playback(
+                rom_image,
+                fps,
+                sample_rate,
+                cycles_per_frame,
+                max_cycles,
+                no_audio,
+            )?;
         }
         Commands::Compat {
             rom_dir,
@@ -585,6 +622,271 @@ fn run_detected_rom_with_checkpoint(
             path: rom.path.clone(),
         }),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveProfile {
+    width: usize,
+    height: usize,
+    cpu_hz: u64,
+    default_cycles_per_frame: u64,
+    scale: Scale,
+    label: &'static str,
+}
+
+enum LiveCore {
+    Gb(aletheia_gb::DmgCore),
+    Nes(aletheia_nes::NesCore),
+    Gba(aletheia_gba::GbaCore),
+}
+
+impl LiveCore {
+    fn reset(&mut self) {
+        match self {
+            Self::Gb(core) => core.reset(),
+            Self::Nes(core) => core.reset(),
+            Self::Gba(core) => core.reset(),
+        }
+    }
+
+    fn tick(&mut self, cycle: u64, input_events: &[InputEvent]) -> (u8, i16) {
+        match self {
+            Self::Gb(core) => core.tick(cycle, input_events),
+            Self::Nes(core) => core.tick(cycle, input_events),
+            Self::Gba(core) => core.tick(cycle, input_events),
+        }
+    }
+}
+
+fn run_live_playback(
+    rom: RomImage,
+    fps: u32,
+    sample_rate: u32,
+    cycles_per_frame: Option<u64>,
+    max_cycles: Option<u64>,
+    no_audio: bool,
+) -> Result<(), CliError> {
+    let fps = fps.max(1);
+    let profile = live_profile_for_format(rom.format)?;
+    let cycles_per_frame = cycles_per_frame
+        .unwrap_or(profile.default_cycles_per_frame)
+        .max(1);
+    let mut core = create_live_core(&rom)?;
+    core.reset();
+
+    let mut window = Window::new(
+        &format!(
+            "Aletheia Live [{}] - ESC quit, P pause",
+            profile.label.to_uppercase()
+        ),
+        profile.width,
+        profile.height,
+        WindowOptions {
+            scale: profile.scale,
+            resize: false,
+            ..WindowOptions::default()
+        },
+    )
+    .map_err(|error| CliError::LivePlayback(error.to_string()))?;
+    let frame_budget = Duration::from_secs_f64(1.0 / (fps as f64));
+    window.set_target_fps(0);
+
+    let mut frame_buffer = vec![0xFF_00_00_00u32; profile.width * profile.height];
+    let mut key_state = HashMap::new();
+    let keymap = [
+        (Key::Z, InputButton::A),
+        (Key::X, InputButton::B),
+        (Key::Enter, InputButton::Start),
+        (Key::Space, InputButton::Select),
+        (Key::Up, InputButton::Up),
+        (Key::Down, InputButton::Down),
+        (Key::Left, InputButton::Left),
+        (Key::Right, InputButton::Right),
+    ];
+
+    let mut audio_stream = if no_audio {
+        None
+    } else {
+        let mut stream = OutputStreamBuilder::open_default_stream()
+            .map_err(|error| CliError::LivePlayback(error.to_string()))?;
+        stream.log_on_drop(false);
+        let sink = Sink::connect_new(stream.mixer());
+        Some((stream, sink))
+    };
+    let mut audio_phase_accumulator = 0u64;
+    let mut total_cycles = 0u64;
+    let mut paused = false;
+    let mut frame_counter = 0u64;
+    let mut title_update_counter = 0u32;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let frame_start = Instant::now();
+        if window.is_key_pressed(Key::P, KeyRepeat::No) {
+            paused = !paused;
+        }
+
+        if !paused {
+            let events = collect_live_input_events(&window, &keymap, &mut key_state, total_cycles);
+            let mut queued_audio = Vec::new();
+            for offset in 0..cycles_per_frame {
+                let cycle = total_cycles + offset;
+                let input_events = if offset == 0 {
+                    events.as_slice()
+                } else {
+                    &[] as &[InputEvent]
+                };
+                let (frame_sample, audio_sample) = core.tick(cycle, input_events);
+                let pixel_index = (cycle as usize) % frame_buffer.len();
+                frame_buffer[pixel_index] = colorize_live_sample(frame_sample, audio_sample, cycle);
+
+                if audio_stream.is_some() {
+                    audio_phase_accumulator += sample_rate as u64;
+                    if audio_phase_accumulator >= profile.cpu_hz {
+                        audio_phase_accumulator -= profile.cpu_hz;
+                        queued_audio.push((audio_sample as f32) / (i16::MAX as f32));
+                    }
+                }
+            }
+            total_cycles += cycles_per_frame;
+            frame_counter = frame_counter.wrapping_add(1);
+
+            if let Some((_, sink)) = audio_stream.as_mut() {
+                if !queued_audio.is_empty() {
+                    sink.append(SamplesBuffer::new(1, sample_rate, queued_audio));
+                }
+            }
+        }
+
+        window
+            .update_with_buffer(&frame_buffer, profile.width, profile.height)
+            .map_err(|error| CliError::LivePlayback(error.to_string()))?;
+        title_update_counter = title_update_counter.wrapping_add(1);
+        if title_update_counter >= fps {
+            let pause_label = if paused { " (paused)" } else { "" };
+            window.set_title(&format!(
+                "Aletheia Live [{}] cycles={} frames={}{}",
+                profile.label.to_uppercase(),
+                total_cycles,
+                frame_counter,
+                pause_label
+            ));
+            title_update_counter = 0;
+        }
+
+        if let Some(max_cycles) = max_cycles {
+            if total_cycles >= max_cycles {
+                break;
+            }
+        }
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_budget {
+            thread::sleep(frame_budget - elapsed);
+        }
+    }
+
+    if let Some((_, sink)) = audio_stream.as_mut() {
+        sink.stop();
+    }
+
+    Ok(())
+}
+
+fn live_profile_for_format(format: RomFormat) -> Result<LiveProfile, CliError> {
+    let profile = match format {
+        RomFormat::Gb | RomFormat::Gbc => LiveProfile {
+            width: 160,
+            height: 144,
+            cpu_hz: 4_194_304,
+            default_cycles_per_frame: 4_194_304 / 60,
+            scale: Scale::X4,
+            label: "gb",
+        },
+        RomFormat::Nes => LiveProfile {
+            width: 256,
+            height: 240,
+            cpu_hz: 1_789_773,
+            default_cycles_per_frame: 1_789_773 / 60,
+            scale: Scale::X2,
+            label: "nes",
+        },
+        RomFormat::Gba => LiveProfile {
+            width: 240,
+            height: 160,
+            cpu_hz: 16_777_216,
+            default_cycles_per_frame: 16_777_216 / 60,
+            scale: Scale::X2,
+            label: "gba",
+        },
+        RomFormat::Unknown => {
+            return Err(CliError::UnsupportedRomFormat {
+                path: "unknown".to_owned(),
+            });
+        }
+    };
+    Ok(profile)
+}
+
+fn create_live_core(rom: &RomImage) -> Result<LiveCore, CliError> {
+    match rom.format {
+        RomFormat::Gb | RomFormat::Gbc => {
+            let mut core = aletheia_gb::DmgCore::default();
+            core.load_rom(&rom.bytes)
+                .map_err(|error| CliError::LivePlayback(error.to_string()))?;
+            Ok(LiveCore::Gb(core))
+        }
+        RomFormat::Nes => {
+            let mut core = aletheia_nes::NesCore::default();
+            core.load_rom(&rom.bytes)
+                .map_err(|error| CliError::LivePlayback(error.to_string()))?;
+            Ok(LiveCore::Nes(core))
+        }
+        RomFormat::Gba => {
+            let mut core = aletheia_gba::GbaCore::default();
+            core.load_rom(&rom.bytes);
+            Ok(LiveCore::Gba(core))
+        }
+        RomFormat::Unknown => Err(CliError::UnsupportedRomFormat {
+            path: rom.path.clone(),
+        }),
+    }
+}
+
+fn collect_live_input_events(
+    window: &Window,
+    keymap: &[(Key, InputButton)],
+    key_state: &mut HashMap<Key, bool>,
+    cycle: u64,
+) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    for (key, button) in keymap {
+        let now_pressed = window.is_key_down(*key);
+        let was_pressed = *key_state.get(key).unwrap_or(&false);
+        if now_pressed != was_pressed {
+            events.push(InputEvent {
+                cycle,
+                port: 0,
+                button: *button,
+                state: if now_pressed {
+                    InputState::Pressed
+                } else {
+                    InputState::Released
+                },
+            });
+            key_state.insert(*key, now_pressed);
+        }
+    }
+    events
+}
+
+fn colorize_live_sample(frame_sample: u8, audio_sample: i16, cycle: u64) -> u32 {
+    let frame = frame_sample as u32;
+    let audio = (((audio_sample as i32) + 32_768) as u32) >> 8;
+    let drift = (cycle as u32) & 0xFF;
+    let r = frame ^ drift;
+    let g = audio ^ (drift.rotate_left(1) & 0xFF);
+    let b = (frame ^ audio) & 0xFF;
+    0xFF00_0000 | (r << 16) | (g << 8) | b
 }
 
 fn run_compat_entries(
@@ -1316,5 +1618,20 @@ mod tests {
         )
         .expect_err("missing reference source should fail");
         assert!(matches!(error, CliError::MissingReferenceSource));
+    }
+
+    #[test]
+    fn live_profile_supports_gba() {
+        let profile = live_profile_for_format(RomFormat::Gba).expect("gba live profile");
+        assert_eq!(profile.width, 240);
+        assert_eq!(profile.height, 160);
+        assert_eq!(profile.cpu_hz, 16_777_216);
+    }
+
+    #[test]
+    fn live_colorizer_is_stable_for_same_inputs() {
+        let a = colorize_live_sample(0x12, -300, 42);
+        let b = colorize_live_sample(0x12, -300, 42);
+        assert_eq!(a, b);
     }
 }
