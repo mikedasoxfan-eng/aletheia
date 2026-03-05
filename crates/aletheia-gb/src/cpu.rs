@@ -391,7 +391,8 @@ mod tests {
 
     #[test]
     fn jp_and_jr_change_program_counter() {
-        let (mut cpu, mut bus) = cpu_with_program(&[0xC3, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0xFE]);
+        let (mut cpu, mut bus) =
+            cpu_with_program(&[0xC3, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0xFE]);
         cpu.step(&mut bus); // JP 0108
         assert_eq!(cpu.regs().pc, 0x0108);
         cpu.step(&mut bus); // JR -2
@@ -402,11 +403,11 @@ mod tests {
     fn call_and_ret_round_trip_program_counter() {
         let (mut cpu, mut bus) = cpu_with_program(&[
             0xCD, 0x06, 0x01, // CALL 0106
-            0x00,             // NOP
-            0x00,             // NOP
-            0x00,             // NOP
-            0x3E, 0x44,       // LD A,44
-            0xC9,             // RET
+            0x00, // NOP
+            0x00, // NOP
+            0x00, // NOP
+            0x3E, 0x44, // LD A,44
+            0xC9, // RET
         ]);
         cpu.step(&mut bus);
         assert_eq!(cpu.regs().pc, 0x0106);
@@ -433,7 +434,9 @@ mod tests {
         bus.write8(IE_ADDR, 0x04);
         bus.write8(IF_ADDR, 0x04);
 
-        let cycles = cpu.service_interrupt(&mut bus).expect("interrupt should fire");
+        let cycles = cpu
+            .service_interrupt(&mut bus)
+            .expect("interrupt should fire");
         assert_eq!(cycles, 20);
         assert_eq!(cpu.regs().pc, 0x0050);
     }

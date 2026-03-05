@@ -4,6 +4,7 @@ use aletheia_core::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use serde_json::Value;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,27 @@ enum Commands {
         #[arg(long)]
         replay: Option<PathBuf>,
         #[arg(long, default_value = "lab-output/run-rom")]
+        output_dir: PathBuf,
+    },
+    /// Run all supported ROM files in a directory tree and emit compatibility artifacts.
+    Compat {
+        rom_dir: PathBuf,
+        #[arg(long, default_value_t = 100_000)]
+        cycles: u64,
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        #[arg(long, default_value = "lab-output/compat")]
+        output_dir: PathBuf,
+    },
+    /// Compare Aletheia ROM output against a reference JSON report.
+    DiffRom {
+        rom: PathBuf,
+        reference_report: PathBuf,
+        #[arg(long, default_value_t = 100_000)]
+        cycles: u64,
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        #[arg(long, default_value = "lab-output/diff")]
         output_dir: PathBuf,
     },
 }
@@ -100,6 +122,49 @@ struct RunRomReport {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct CompatReport {
+    report_schema_version: u16,
+    cycles: u64,
+    replay_events: usize,
+    total: usize,
+    passed: usize,
+    failed: usize,
+    entries: Vec<CompatEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatEntry {
+    rom_path: String,
+    rom_format: String,
+    success: bool,
+    digest: Option<RunDigest>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ReferenceDigest {
+    source_path: String,
+    frame_hash: String,
+    audio_hash: String,
+    system: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffReport {
+    report_schema_version: u16,
+    rom: RomImage,
+    cycles: u64,
+    replay_events: usize,
+    local_success: bool,
+    local_digest: Option<RunDigest>,
+    local_error: Option<String>,
+    reference: ReferenceDigest,
+    frame_match: bool,
+    audio_match: bool,
+    all_match: bool,
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{0}")]
@@ -116,6 +181,12 @@ enum CliError {
     SuiteFailed { failed: usize },
     #[error("ROM execution failed: {0}")]
     RomRunFailed(String),
+    #[error("compatibility run completed with {failed} failures")]
+    CompatFailed { failed: usize },
+    #[error("failed to parse reference digest from '{path}'")]
+    InvalidReferenceReport { path: String },
+    #[error("diff mismatch for ROM '{rom}'")]
+    DiffMismatch { rom: String },
 }
 
 fn main() {
@@ -246,6 +317,138 @@ fn run() -> Result<(), CliError> {
                 ));
             }
         }
+        Commands::Compat {
+            rom_dir,
+            cycles,
+            replay,
+            output_dir,
+        } => {
+            fs::create_dir_all(&output_dir)?;
+            let replay_log = load_replay(replay)?;
+            let rom_paths = collect_supported_rom_paths(&rom_dir)?;
+
+            let mut entries = Vec::with_capacity(rom_paths.len());
+            let mut passed = 0usize;
+            let mut failed = 0usize;
+
+            for rom_path in rom_paths {
+                let rom_path_str = rom_path.to_string_lossy().to_string();
+                match load_rom_image(&rom_path) {
+                    Ok(rom_image) => match run_detected_rom(&rom_image, cycles, &replay_log) {
+                        Ok(digest) => {
+                            passed += 1;
+                            entries.push(CompatEntry {
+                                rom_path: rom_path_str,
+                                rom_format: rom_image.format.as_label().to_owned(),
+                                success: true,
+                                digest: Some(digest),
+                                error: None,
+                            });
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            entries.push(CompatEntry {
+                                rom_path: rom_path_str,
+                                rom_format: rom_image.format.as_label().to_owned(),
+                                success: false,
+                                digest: None,
+                                error: Some(error.to_string()),
+                            });
+                        }
+                    },
+                    Err(error) => {
+                        failed += 1;
+                        entries.push(CompatEntry {
+                            rom_path: rom_path_str,
+                            rom_format: "unknown".to_owned(),
+                            success: false,
+                            digest: None,
+                            error: Some(error.to_string()),
+                        });
+                    }
+                }
+            }
+
+            let report = CompatReport {
+                report_schema_version: 1,
+                cycles,
+                replay_events: replay_log.events.len(),
+                total: entries.len(),
+                passed,
+                failed,
+                entries,
+            };
+            let json = serde_json::to_string_pretty(&report)?;
+            write_text_file(&output_dir.join("compat.json"), &format!("{json}\n"))?;
+            write_text_file(
+                &output_dir.join("compat.html"),
+                &render_compat_html(&report),
+            )?;
+            write_text_file(
+                &output_dir.join("replay.trace.txt"),
+                &render_replay_trace(&replay_log),
+            )?;
+
+            if failed > 0 {
+                return Err(CliError::CompatFailed { failed });
+            }
+        }
+        Commands::DiffRom {
+            rom,
+            reference_report,
+            cycles,
+            replay,
+            output_dir,
+        } => {
+            fs::create_dir_all(&output_dir)?;
+            let replay_log = load_replay(replay)?;
+            let rom_image = load_rom_image(&rom)?;
+            let reference = parse_reference_digest(&reference_report)?;
+
+            let local_run = run_detected_rom(&rom_image, cycles, &replay_log);
+            let (local_success, local_digest, local_error) = match local_run {
+                Ok(digest) => (true, Some(digest), None),
+                Err(error) => (false, None, Some(error.to_string())),
+            };
+
+            let frame_match = local_digest
+                .as_ref()
+                .map(|digest| digest.frame_hash == reference.frame_hash)
+                .unwrap_or(false);
+            let audio_match = local_digest
+                .as_ref()
+                .map(|digest| digest.audio_hash == reference.audio_hash)
+                .unwrap_or(false);
+            let all_match = local_success && frame_match && audio_match;
+
+            let report = DiffReport {
+                report_schema_version: 1,
+                rom: rom_image,
+                cycles,
+                replay_events: replay_log.events.len(),
+                local_success,
+                local_digest,
+                local_error,
+                reference,
+                frame_match,
+                audio_match,
+                all_match,
+            };
+
+            let json = serde_json::to_string_pretty(&report)?;
+            write_text_file(&output_dir.join("diff.json"), &format!("{json}\n"))?;
+            write_text_file(&output_dir.join("diff.html"), &render_diff_html(&report))?;
+            write_text_file(
+                &output_dir.join("replay.trace.txt"),
+                &render_replay_trace(&replay_log),
+            )?;
+
+            if !report.all_match {
+                return Err(CliError::DiffMismatch {
+                    rom: report.rom.path,
+                });
+            }
+        }
     }
 
     Ok(())
@@ -279,6 +482,89 @@ fn run_detected_rom(
             path: rom.path.clone(),
         }),
     }
+}
+
+fn parse_reference_digest(path: &Path) -> Result<ReferenceDigest, CliError> {
+    let raw = fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&raw)?;
+
+    if let Some(digest) = extract_digest_from_value(&value) {
+        return Ok(ReferenceDigest {
+            source_path: path.to_string_lossy().to_string(),
+            frame_hash: digest.0,
+            audio_hash: digest.1,
+            system: digest.2,
+        });
+    }
+
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(digest_node) = entry.get("digest") {
+                if let Some((frame, audio, _)) = extract_digest_from_value(digest_node) {
+                    let system = entry
+                        .get("system")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    return Ok(ReferenceDigest {
+                        source_path: path.to_string_lossy().to_string(),
+                        frame_hash: frame,
+                        audio_hash: audio,
+                        system,
+                    });
+                }
+            }
+        }
+    }
+
+    Err(CliError::InvalidReferenceReport {
+        path: path.to_string_lossy().to_string(),
+    })
+}
+
+fn extract_digest_from_value(value: &Value) -> Option<(String, String, Option<String>)> {
+    if let Some(digest) = value.get("digest") {
+        return extract_digest_from_value(digest);
+    }
+
+    let frame = value.get("frame_hash")?.as_str()?.to_owned();
+    let audio = value.get("audio_hash")?.as_str()?.to_owned();
+    let system = value
+        .get("system")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Some((frame, audio, system))
+}
+
+fn collect_supported_rom_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let mut out = Vec::new();
+    collect_supported_rom_paths_impl(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn collect_supported_rom_paths_impl(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_supported_rom_paths_impl(&path, out)?;
+        } else if is_supported_rom_extension(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_rom_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "gb" | "gbc" | "nes" | "gba"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn load_replay(path: Option<PathBuf>) -> Result<ReplayLog, CliError> {
@@ -382,6 +668,64 @@ fn render_run_rom_html(report: &RunRomReport) -> String {
     )
 }
 
+fn render_compat_html(report: &CompatReport) -> String {
+    let mut rows = String::new();
+
+    for entry in &report.entries {
+        let status = if entry.success { "PASS" } else { "FAIL" };
+        let frame_hash = entry
+            .digest
+            .as_ref()
+            .map(|digest| digest.frame_hash.as_str())
+            .unwrap_or("-");
+        let audio_hash = entry
+            .digest
+            .as_ref()
+            .map(|digest| digest.audio_hash.as_str())
+            .unwrap_or("-");
+        let error = entry.error.as_deref().unwrap_or("");
+
+        let _ = writeln!(
+            rows,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>",
+            entry.rom_path, entry.rom_format, status, frame_hash, audio_hash, error
+        );
+    }
+
+    format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Compatibility Report</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia Compatibility Report</h1>\n<p>Cycles {} | Replay events {} | Total {} | Passed {} | Failed {}</p>\n<table>\n<thead><tr><th>ROM</th><th>Format</th><th>Status</th><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody>\n{}\n</tbody>\n</table>\n</body>\n</html>\n",
+        report.cycles, report.replay_events, report.total, report.passed, report.failed, rows
+    )
+}
+
+fn render_diff_html(report: &DiffReport) -> String {
+    let local_frame = report
+        .local_digest
+        .as_ref()
+        .map(|digest| digest.frame_hash.as_str())
+        .unwrap_or("-");
+    let local_audio = report
+        .local_digest
+        .as_ref()
+        .map(|digest| digest.audio_hash.as_str())
+        .unwrap_or("-");
+
+    format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Diff Report</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia Differential Report</h1>\n<p><strong>ROM:</strong> {} | <strong>Format:</strong> {} | <strong>All Match:</strong> {}</p>\n<table>\n<thead><tr><th>Source</th><th>Frame Hash</th><th>Audio Hash</th></tr></thead>\n<tbody>\n<tr><td>Aletheia</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n<tr><td>Reference ({})</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n</tbody>\n</table>\n<p>Frame Match: {} | Audio Match: {}</p>\n<p>{}</p>\n</body>\n</html>\n",
+        report.rom.path,
+        report.rom.format.as_label(),
+        report.all_match,
+        local_frame,
+        local_audio,
+        report.reference.source_path,
+        report.reference.frame_hash,
+        report.reference.audio_hash,
+        report.frame_match,
+        report.audio_match,
+        report.local_error.as_deref().unwrap_or("")
+    )
+}
+
 fn render_replay_trace(replay: &ReplayLog) -> String {
     let mut output = String::new();
     output.push_str("# Replay Events\n");
@@ -482,5 +826,38 @@ mod tests {
         let trace = render_replay_trace(&replay);
         assert!(trace.contains("# Replay Events"));
         assert!(trace.contains("cycle,port,button,state"));
+    }
+
+    #[test]
+    fn parses_reference_digest_from_aletheia_schema() {
+        let value = serde_json::json!({
+            "digest": {
+                "frame_hash": "a",
+                "audio_hash": "b",
+                "system": "Nes"
+            }
+        });
+        let parsed = extract_digest_from_value(&value).expect("digest");
+        assert_eq!(parsed.0, "a");
+        assert_eq!(parsed.1, "b");
+        assert_eq!(parsed.2.as_deref(), Some("Nes"));
+    }
+
+    #[test]
+    fn parses_reference_digest_from_flat_schema() {
+        let value = serde_json::json!({
+            "frame_hash": "x",
+            "audio_hash": "y"
+        });
+        let parsed = extract_digest_from_value(&value).expect("digest");
+        assert_eq!(parsed.0, "x");
+        assert_eq!(parsed.1, "y");
+    }
+
+    #[test]
+    fn supported_extension_check_works() {
+        assert!(is_supported_rom_extension(Path::new("a.gb")));
+        assert!(is_supported_rom_extension(Path::new("a.GBA")));
+        assert!(!is_supported_rom_extension(Path::new("a.txt")));
     }
 }

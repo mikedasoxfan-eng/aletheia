@@ -404,7 +404,8 @@ mod tests {
 
     #[test]
     fn bne_branch_is_taken_when_zero_clear() {
-        let (mut cpu, mut bus) = cpu_with_program(&[0xA9, 0x01, 0xD0, 0x02, 0xA9, 0x11, 0xA9, 0x22]);
+        let (mut cpu, mut bus) =
+            cpu_with_program(&[0xA9, 0x01, 0xD0, 0x02, 0xA9, 0x11, 0xA9, 0x22]);
         cpu.step(&mut bus).expect("lda");
         cpu.step(&mut bus).expect("bne");
         cpu.step(&mut bus).expect("lda 22");
@@ -432,7 +433,10 @@ mod tests {
 
         cpu.step(&mut bus).expect("step");
         assert_eq!(cpu.regs().p & FLAG_DECIMAL, FLAG_DECIMAL);
-        assert_eq!(cpu.regs().p & FLAG_INTERRUPT_DISABLE, FLAG_INTERRUPT_DISABLE);
+        assert_eq!(
+            cpu.regs().p & FLAG_INTERRUPT_DISABLE,
+            FLAG_INTERRUPT_DISABLE
+        );
 
         cpu.step(&mut bus).expect("step");
         assert_eq!(cpu.regs().p & FLAG_DECIMAL, FLAG_DECIMAL);

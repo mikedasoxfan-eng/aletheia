@@ -346,7 +346,8 @@ impl GbaCore {
                     } else {
                         self.cpsr &= !CPSR_C_BIT;
                     }
-                    let overflow = ((self.gpr[rn] ^ operand2) & (self.gpr[rn] ^ result) & 0x8000_0000) != 0;
+                    let overflow =
+                        ((self.gpr[rn] ^ operand2) & (self.gpr[rn] ^ result) & 0x8000_0000) != 0;
                     if overflow {
                         self.cpsr |= CPSR_V_BIT;
                     } else {
@@ -376,7 +377,8 @@ impl GbaCore {
                     } else {
                         self.cpsr &= !CPSR_C_BIT;
                     }
-                    let overflow = ((!(self.gpr[rn] ^ operand2)) & (self.gpr[rn] ^ result) & 0x8000_0000) != 0;
+                    let overflow =
+                        ((!(self.gpr[rn] ^ operand2)) & (self.gpr[rn] ^ result) & 0x8000_0000) != 0;
                     if overflow {
                         self.cpsr |= CPSR_V_BIT;
                     } else {
@@ -745,7 +747,8 @@ impl GbaCore {
                 if !is_compressed {
                     let value = self.bus.read8(src);
                     src = src.wrapping_add(1);
-                    self.bus.write8(dst_start.wrapping_add(produced as u32), value);
+                    self.bus
+                        .write8(dst_start.wrapping_add(produced as u32), value);
                     produced += 1;
                     continue;
                 }
@@ -762,7 +765,8 @@ impl GbaCore {
                     }
                     let from = produced.saturating_sub(disp);
                     let value = self.bus.read8(dst_start.wrapping_add(from as u32));
-                    self.bus.write8(dst_start.wrapping_add(produced as u32), value);
+                    self.bus
+                        .write8(dst_start.wrapping_add(produced as u32), value);
                     produced += 1;
                 }
             }
