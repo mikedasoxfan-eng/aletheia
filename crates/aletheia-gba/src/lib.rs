@@ -1,6 +1,6 @@
 use aletheia_core::{
-    DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
-    run_deterministic,
+    CheckpointDigest, DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest,
+    SystemId, run_deterministic, run_deterministic_with_checkpoint,
 };
 use thiserror::Error;
 
@@ -105,7 +105,7 @@ impl GbaBus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GbaCore {
     bus: GbaBus,
     gpr: [u32; 16],
@@ -833,6 +833,24 @@ pub fn run_rom_digest(
         return Err(GbaRunError::Cpu(fault.clone()));
     }
     Ok(digest)
+}
+
+pub fn run_rom_digest_with_checkpoint(
+    cycles: u64,
+    replay: &ReplayLog,
+    rom: &[u8],
+    checkpoint_cycle: u64,
+) -> Result<CheckpointDigest, GbaRunError> {
+    if rom.is_empty() {
+        return Err(GbaRunError::EmptyRom);
+    }
+    let mut core = GbaCore::default();
+    core.load_rom(rom);
+    let result = run_deterministic_with_checkpoint(&mut core, cycles, replay, checkpoint_cycle)?;
+    if let Some(fault) = core.fault() {
+        return Err(GbaRunError::Cpu(fault.clone()));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

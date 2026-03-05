@@ -9,15 +9,15 @@ pub use cartridge::{
 pub use cpu::{NesCpu, NesCpuError, Registers, StepInfo};
 
 use aletheia_core::{
-    DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
-    run_deterministic,
+    CheckpointDigest, DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest,
+    SystemId, run_deterministic, run_deterministic_with_checkpoint,
 };
 use thiserror::Error;
 
 const BOOT_PROGRAM: [u8; 7] = [0xA9, 0x11, 0xAA, 0xE8, 0xCA, 0xEA, 0xEA];
 const CONTROLLER_PORT: u16 = 0x4016;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NesCore {
     cpu: NesCpu,
     bus: NesBus,
@@ -116,6 +116,21 @@ pub fn run_rom_digest(
         return Err(NesRunError::Cpu(fault.to_owned()));
     }
     Ok(digest)
+}
+
+pub fn run_rom_digest_with_checkpoint(
+    cycles: u64,
+    replay: &ReplayLog,
+    rom: &[u8],
+    checkpoint_cycle: u64,
+) -> Result<CheckpointDigest, NesRunError> {
+    let mut core = NesCore::default();
+    core.load_rom(rom)?;
+    let result = run_deterministic_with_checkpoint(&mut core, cycles, replay, checkpoint_cycle)?;
+    if let Some(fault) = core.cpu_fault() {
+        return Err(NesRunError::Cpu(fault.to_owned()));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

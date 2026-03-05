@@ -45,7 +45,7 @@ pub struct StepInfo {
     pub cycles: u8,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GbCpu {
     regs: Registers,
     ime: bool,

@@ -31,7 +31,7 @@ pub enum NesCpuError {
     UnsupportedOpcode { opcode: u8, pc: u16 },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NesCpu {
     regs: Registers,
 }

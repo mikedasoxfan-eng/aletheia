@@ -11,15 +11,15 @@ pub use cpu::{GbCpu, Registers, StepInfo};
 pub use timer::GbTimer;
 
 use aletheia_core::{
-    DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
-    run_deterministic,
+    CheckpointDigest, DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest,
+    SystemId, run_deterministic, run_deterministic_with_checkpoint,
 };
 use thiserror::Error;
 
 const BOOT_PROGRAM: [u8; 9] = [0x3E, 0x10, 0x3C, 0x3D, 0xAF, 0x3E, 0x42, 0x00, 0x00];
 const JOYPAD_REG: u16 = 0xFF00;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DmgCore {
     cpu: GbCpu,
     bus: GbBus,
@@ -123,6 +123,22 @@ pub fn run_rom_digest(
     let mut core = DmgCore::default();
     core.load_rom(rom)?;
     Ok(run_deterministic(&mut core, cycles, replay)?)
+}
+
+pub fn run_rom_digest_with_checkpoint(
+    cycles: u64,
+    replay: &ReplayLog,
+    rom: &[u8],
+    checkpoint_cycle: u64,
+) -> Result<CheckpointDigest, GbRunError> {
+    let mut core = DmgCore::default();
+    core.load_rom(rom)?;
+    Ok(run_deterministic_with_checkpoint(
+        &mut core,
+        cycles,
+        replay,
+        checkpoint_cycle,
+    )?)
 }
 
 #[cfg(test)]

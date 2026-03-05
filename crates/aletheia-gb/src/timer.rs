@@ -7,7 +7,7 @@ const TAC_ADDR: u16 = 0xFF07;
 const IF_ADDR: u16 = 0xFF0F;
 const TIMER_IRQ_MASK: u8 = 0x04;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GbTimer {
     div_counter: u16,
     timer_counter: u16,
