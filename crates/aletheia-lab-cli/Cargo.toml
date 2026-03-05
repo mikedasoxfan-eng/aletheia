@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 aletheia-core = { path = "../aletheia-core" }
+aletheia-gba = { path = "../aletheia-gba" }
 aletheia-gb = { path = "../aletheia-gb" }
 aletheia-nes = { path = "../aletheia-nes" }
 clap.workspace = true

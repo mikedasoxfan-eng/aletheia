@@ -87,7 +87,11 @@ pub enum NesRunError {
     Determinism(#[from] DeterminismError),
 }
 
-pub fn run_rom_digest(cycles: u64, replay: &ReplayLog, rom: &[u8]) -> Result<RunDigest, NesRunError> {
+pub fn run_rom_digest(
+    cycles: u64,
+    replay: &ReplayLog,
+    rom: &[u8],
+) -> Result<RunDigest, NesRunError> {
     let mut core = NesCore::default();
     core.load_rom(rom)?;
     Ok(run_deterministic(&mut core, cycles, replay)?)

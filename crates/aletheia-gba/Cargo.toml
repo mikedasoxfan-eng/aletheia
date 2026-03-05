@@ -1,0 +1,9 @@
+[package]
+name = "aletheia-gba"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aletheia-core = { path = "../aletheia-core" }
+thiserror.workspace = true

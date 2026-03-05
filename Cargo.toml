@@ -3,6 +3,7 @@ members = [
   "crates/aletheia-core",
   "crates/aletheia-gb",
   "crates/aletheia-nes",
+  "crates/aletheia-gba",
   "crates/aletheia-lab-cli",
 ]
 resolver = "2"

@@ -139,7 +139,9 @@ pub fn detect_rom_format(path: &Path, bytes: &[u8]) -> RomFormat {
 
 fn parse_metadata(format: RomFormat, bytes: &[u8]) -> RomMetadata {
     match format {
-        RomFormat::Gb | RomFormat::Gbc => parse_gb_metadata(bytes).map_or(RomMetadata::Unknown, RomMetadata::Gb),
+        RomFormat::Gb | RomFormat::Gbc => {
+            parse_gb_metadata(bytes).map_or(RomMetadata::Unknown, RomMetadata::Gb)
+        }
         RomFormat::Nes => parse_nes_metadata(bytes).map_or(RomMetadata::Unknown, RomMetadata::Nes),
         RomFormat::Gba => parse_gba_metadata(bytes).map_or(RomMetadata::Unknown, RomMetadata::Gba),
         RomFormat::Unknown => RomMetadata::Unknown,

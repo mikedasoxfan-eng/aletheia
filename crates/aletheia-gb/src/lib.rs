@@ -3,7 +3,9 @@ mod cartridge;
 mod cpu;
 
 pub use bus::{GbBus, PROGRAM_START};
-pub use cartridge::{CartridgeError as GbCartridgeError, CartridgeInfo as GbCartridgeInfo, MbcKind};
+pub use cartridge::{
+    CartridgeError as GbCartridgeError, CartridgeInfo as GbCartridgeInfo, MbcKind,
+};
 pub use cpu::{GbCpu, Registers, StepInfo};
 
 use aletheia_core::{
@@ -102,7 +104,11 @@ pub enum GbRunError {
     Determinism(#[from] DeterminismError),
 }
 
-pub fn run_rom_digest(cycles: u64, replay: &ReplayLog, rom: &[u8]) -> Result<RunDigest, GbRunError> {
+pub fn run_rom_digest(
+    cycles: u64,
+    replay: &ReplayLog,
+    rom: &[u8],
+) -> Result<RunDigest, GbRunError> {
     let mut core = DmgCore::default();
     core.load_rom(rom)?;
     Ok(run_deterministic(&mut core, cycles, replay)?)

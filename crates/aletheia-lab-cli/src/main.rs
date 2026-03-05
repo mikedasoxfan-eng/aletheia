@@ -1,9 +1,12 @@
-use aletheia_core::{InputButton, InputEvent, InputState, ReplayLog, RunDigest};
+use aletheia_core::{
+    InputButton, InputEvent, InputState, ReplayLog, RomError, RomFormat, RomImage, RunDigest,
+    load_rom_image,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -36,6 +39,16 @@ enum Commands {
         #[arg(long)]
         replay: Option<PathBuf>,
         #[arg(long, default_value = "lab-output/suite")]
+        output_dir: PathBuf,
+    },
+    /// Run a user ROM (`.gb`, `.gbc`, `.nes`, `.gba`) and emit report artifacts.
+    RunRom {
+        rom: PathBuf,
+        #[arg(long, default_value_t = 100_000)]
+        cycles: u64,
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        #[arg(long, default_value = "lab-output/run-rom")]
         output_dir: PathBuf,
     },
 }
@@ -76,6 +89,17 @@ struct SuiteEntry {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RunRomReport {
+    report_schema_version: u16,
+    rom: RomImage,
+    cycles: u64,
+    replay_events: usize,
+    success: bool,
+    digest: Option<RunDigest>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{0}")]
@@ -84,8 +108,14 @@ enum CliError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Determinism(#[from] aletheia_core::DeterminismError),
+    #[error("{0}")]
+    Rom(#[from] RomError),
+    #[error("unsupported or unknown ROM format for '{path}'")]
+    UnsupportedRomFormat { path: String },
     #[error("suite completed with {failed} failures")]
     SuiteFailed { failed: usize },
+    #[error("ROM execution failed: {0}")]
+    RomRunFailed(String),
 }
 
 fn main() {
@@ -115,12 +145,7 @@ fn run() -> Result<(), CliError> {
             let json = serde_json::to_string_pretty(&report)?;
 
             if let Some(output_path) = output {
-                if let Some(parent) = output_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
-                fs::write(output_path, format!("{json}\n"))?;
+                write_text_file(&output_path, &format!("{json}\n"))?;
             } else {
                 println!("{json}");
             }
@@ -163,11 +188,62 @@ fn run() -> Result<(), CliError> {
                 entries,
             };
             let json = serde_json::to_string_pretty(&report)?;
-            fs::write(output_dir.join("summary.json"), format!("{json}\n"))?;
-            fs::write(output_dir.join("summary.html"), render_suite_html(&report))?;
+            write_text_file(&output_dir.join("summary.json"), &format!("{json}\n"))?;
+            write_text_file(
+                &output_dir.join("summary.html"),
+                &render_suite_html(&report),
+            )?;
+            write_text_file(
+                &output_dir.join("replay.trace.txt"),
+                &render_replay_trace(&replay_log),
+            )?;
 
             if failed > 0 {
                 return Err(CliError::SuiteFailed { failed });
+            }
+        }
+        Commands::RunRom {
+            rom,
+            cycles,
+            replay,
+            output_dir,
+        } => {
+            fs::create_dir_all(&output_dir)?;
+            let replay_log = load_replay(replay)?;
+            let rom_image = load_rom_image(&rom)?;
+
+            let digest_result = run_detected_rom(&rom_image, cycles, &replay_log);
+            let (success, digest, error) = match digest_result {
+                Ok(digest) => (true, Some(digest), None),
+                Err(error) => (false, None, Some(error.to_string())),
+            };
+
+            let report = RunRomReport {
+                report_schema_version: 1,
+                rom: rom_image,
+                cycles,
+                replay_events: replay_log.events.len(),
+                success,
+                digest,
+                error,
+            };
+
+            let json = serde_json::to_string_pretty(&report)?;
+            write_text_file(&output_dir.join("run.json"), &format!("{json}\n"))?;
+            write_text_file(&output_dir.join("run.html"), &render_run_rom_html(&report))?;
+            write_text_file(
+                &output_dir.join("replay.trace.txt"),
+                &render_replay_trace(&replay_log),
+            )?;
+
+            if !report.success {
+                return Err(CliError::RomRunFailed(
+                    report
+                        .error
+                        .as_deref()
+                        .unwrap_or("unknown ROM execution failure")
+                        .to_owned(),
+                ));
             }
         }
     }
@@ -185,6 +261,24 @@ fn run_smoke(
         SystemArg::Nes => aletheia_nes::smoke_digest(cycles, replay_log)?,
     };
     Ok(digest)
+}
+
+fn run_detected_rom(
+    rom: &RomImage,
+    cycles: u64,
+    replay: &ReplayLog,
+) -> Result<RunDigest, CliError> {
+    match rom.format {
+        RomFormat::Gb | RomFormat::Gbc => aletheia_gb::run_rom_digest(cycles, replay, &rom.bytes)
+            .map_err(|error| CliError::RomRunFailed(error.to_string())),
+        RomFormat::Nes => aletheia_nes::run_rom_digest(cycles, replay, &rom.bytes)
+            .map_err(|error| CliError::RomRunFailed(error.to_string())),
+        RomFormat::Gba => aletheia_gba::run_rom_digest(cycles, replay, &rom.bytes)
+            .map_err(|error| CliError::RomRunFailed(error.to_string())),
+        RomFormat::Unknown => Err(CliError::UnsupportedRomFormat {
+            path: rom.path.clone(),
+        }),
+    }
 }
 
 fn load_replay(path: Option<PathBuf>) -> Result<ReplayLog, CliError> {
@@ -220,6 +314,16 @@ fn default_replay_fixture() -> ReplayLog {
     ])
 }
 
+fn write_text_file(path: &Path, content: &str) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
 fn render_suite_html(report: &SuiteReport) -> String {
     let mut rows = String::new();
 
@@ -246,6 +350,50 @@ fn render_suite_html(report: &SuiteReport) -> String {
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia Suite Report</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia Deterministic Suite</h1>\n<p>Schema v{} | Cycles {}</p>\n<table>\n<thead><tr><th>System</th><th>Status</th><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody>\n{}\n</tbody>\n</table>\n</body>\n</html>\n",
         report.report_schema_version, report.cycles, rows
     )
+}
+
+fn render_run_rom_html(report: &RunRomReport) -> String {
+    let (status, frame_hash, audio_hash, error) = if let Some(digest) = &report.digest {
+        (
+            "PASS",
+            digest.frame_hash.as_str(),
+            digest.audio_hash.as_str(),
+            "",
+        )
+    } else {
+        (
+            "FAIL",
+            "-",
+            "-",
+            report.error.as_deref().unwrap_or("unknown ROM run failure"),
+        )
+    };
+
+    format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Aletheia ROM Run</title>\n<style>body{{font-family:Segoe UI,Arial,sans-serif;padding:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f4f4f4}}code{{font-size:12px}}</style>\n</head>\n<body>\n<h1>Aletheia ROM Run</h1>\n<p><strong>ROM:</strong> {}</p>\n<p><strong>Format:</strong> {} | <strong>Size:</strong> {} bytes | <strong>Cycles:</strong> {}</p>\n<p><strong>Status:</strong> {}</p>\n<table>\n<thead><tr><th>Frame Hash</th><th>Audio Hash</th><th>Error</th></tr></thead>\n<tbody><tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr></tbody>\n</table>\n</body>\n</html>\n",
+        report.rom.path,
+        report.rom.format.as_label(),
+        report.rom.byte_len,
+        report.cycles,
+        status,
+        frame_hash,
+        audio_hash,
+        error
+    )
+}
+
+fn render_replay_trace(replay: &ReplayLog) -> String {
+    let mut output = String::new();
+    output.push_str("# Replay Events\n");
+    output.push_str("# cycle,port,button,state\n");
+    for event in replay.sorted_events() {
+        let _ = writeln!(
+            output,
+            "{},{},{:?},{:?}",
+            event.cycle, event.port, event.button, event.state
+        );
+    }
+    output
 }
 
 #[cfg(test)]
@@ -293,5 +441,46 @@ mod tests {
         assert!(html.contains("nes"));
         assert!(html.contains("PASS"));
         assert!(html.contains("FAIL"));
+    }
+
+    #[test]
+    fn run_rom_html_renders_basic_metadata() {
+        let report = RunRomReport {
+            report_schema_version: 1,
+            rom: RomImage {
+                path: "C:/tmp/test.gba".to_owned(),
+                format: RomFormat::Gba,
+                byte_len: 1024,
+                blake3: "hash".to_owned(),
+                metadata: aletheia_core::RomMetadata::Unknown,
+                bytes: vec![],
+            },
+            cycles: 64,
+            replay_events: 0,
+            success: true,
+            digest: Some(RunDigest {
+                schema_version: 1,
+                replay_version: 1,
+                system: aletheia_core::SystemId::Gba,
+                executed_cycles: 64,
+                applied_events: 0,
+                frame_hash: "ff".to_owned(),
+                audio_hash: "aa".to_owned(),
+            }),
+            error: None,
+        };
+
+        let html = render_run_rom_html(&report);
+        assert!(html.contains("test.gba"));
+        assert!(html.contains("gba"));
+        assert!(html.contains("PASS"));
+    }
+
+    #[test]
+    fn replay_trace_renders_header_and_lines() {
+        let replay = default_replay_fixture();
+        let trace = render_replay_trace(&replay);
+        assert!(trace.contains("# Replay Events"));
+        assert!(trace.contains("cycle,port,button,state"));
     }
 }

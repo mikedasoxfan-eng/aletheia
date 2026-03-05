@@ -20,11 +20,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aletheia-gba"
+version = "0.1.0"
+dependencies = [
+ "aletheia-core",
+ "thiserror",
+]
+
+[[package]]
 name = "aletheia-lab-cli"
 version = "0.1.0"
 dependencies = [
  "aletheia-core",
  "aletheia-gb",
+ "aletheia-gba",
  "aletheia-nes",
  "clap",
  "serde",

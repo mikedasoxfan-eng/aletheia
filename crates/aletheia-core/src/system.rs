@@ -6,6 +6,7 @@ pub enum SystemId {
     GbDmg,
     GbCgb,
     Nes,
+    Gba,
 }
 
 impl fmt::Display for SystemId {
@@ -14,6 +15,7 @@ impl fmt::Display for SystemId {
             Self::GbDmg => "gb-dmg",
             Self::GbCgb => "gb-cgb",
             Self::Nes => "nes",
+            Self::Gba => "gba",
         };
         f.write_str(label)
     }
