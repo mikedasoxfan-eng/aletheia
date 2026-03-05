@@ -38,6 +38,8 @@ Implemented today:
     - `.gbc`
     - `.nes` (iNES, NROM mapper path)
     - `.gba` (deterministic bootstrap core path)
+  - `compat` command for recursive directory compatibility runs.
+  - `diff-rom` command to compare local hashes against a reference JSON report.
 - Unit tests covering instruction behavior, flags, reset/vector behavior, cycle counts, and determinism.
 
 ## Current ROM Testing Flow
@@ -52,9 +54,16 @@ Artifacts produced:
 - `run.html` (human-readable report)
 - `replay.trace.txt` (canonical replay event trace)
 
+Additional harness commands:
+
+```bash
+cargo run -p aletheia-lab-cli -- compat USER_SUPPLIED_ROMS/samples --cycles 100000 --output-dir lab-output/compat
+cargo run -p aletheia-lab-cli -- diff-rom USER_SUPPLIED_ROMS/samples/demo.gba lab-output/run-rom-gba/run.json --cycles 1000 --output-dir lab-output/diff
+```
+
 Not implemented yet:
 - Full CPU coverage and cycle-accurate timing behavior.
 - PPU/APU/DMA fidelity and full interrupt/timer edge-case coverage.
 - Full mapper/MBC coverage (MMC1/NROM and MBC1 scaffolds are present; MBC3 RTC, MBC5, and additional NES mappers are pending).
 - Save-state schema and deterministic replay checkpoints.
-- Differential harness against external reference emulators.
+- Differential harness execution against external emulator binaries (current diff path compares against reference JSON outputs).

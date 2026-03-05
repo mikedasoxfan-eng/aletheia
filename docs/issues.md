@@ -13,3 +13,5 @@
 11. Expand GBA core beyond bootstrap subset (THUMB decode, interrupt model, timers).
 12. Add opcode-coverage metrics against selected public test ROM suites (per-system progress report).
 13. Add strict/lenient decode mode flags so unsupported op behavior can be tuned per workflow.
+14. Add external-emulator invocation mode for `diff-rom` (run reference executable paths directly).
+15. Add parallel execution + timeout controls for `compat` directory runs.

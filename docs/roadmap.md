@@ -49,6 +49,16 @@
   - NES MMC1 mapper logic and expanded CPU tests.
   - GBA ARM/THUMB decoder expansion and fault-path tests.
 
+## Slice 2D: Compatibility + Differential Runner
+- Acceptance criteria:
+  - CLI can run recursive ROM compatibility scans for `.gb/.gbc/.nes/.gba`.
+  - CLI can compare local ROM hash output against a reference JSON report.
+  - JSON + HTML artifacts are produced for both compatibility and diff runs.
+- Artifacts:
+  - `compat.json` + `compat.html`.
+  - `diff.json` + `diff.html`.
+  - Replay trace artifacts for each command output.
+
 ## Slice 3: First Real CPU Verticals
 - Acceptance criteria:
   - GB CPU executes a small instruction subset with flag-accurate unit tests.
