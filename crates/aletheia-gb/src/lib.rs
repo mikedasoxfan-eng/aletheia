@@ -1,12 +1,14 @@
 mod bus;
 mod cartridge;
 mod cpu;
+mod timer;
 
 pub use bus::{GbBus, PROGRAM_START};
 pub use cartridge::{
     CartridgeError as GbCartridgeError, CartridgeInfo as GbCartridgeInfo, MbcKind,
 };
 pub use cpu::{GbCpu, Registers, StepInfo};
+pub use timer::GbTimer;
 
 use aletheia_core::{
     DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
@@ -21,6 +23,7 @@ const JOYPAD_REG: u16 = 0xFF00;
 pub struct DmgCore {
     cpu: GbCpu,
     bus: GbBus,
+    timer: GbTimer,
     cycles_until_next_step: u8,
     input_mix: u8,
     system_id: SystemId,
@@ -31,6 +34,7 @@ impl Default for DmgCore {
         Self {
             cpu: GbCpu::default(),
             bus: GbBus::default(),
+            timer: GbTimer::default(),
             cycles_until_next_step: 0,
             input_mix: 0,
             system_id: SystemId::GbDmg,
@@ -65,6 +69,7 @@ impl DeterministicMachine for DmgCore {
             self.system_id = SystemId::GbDmg;
         }
         self.cpu.reset();
+        self.timer.reset(&mut self.bus);
         self.cycles_until_next_step = 0;
         self.input_mix = 0;
     }
@@ -76,9 +81,15 @@ impl DeterministicMachine for DmgCore {
             self.bus.write8(JOYPAD_REG, self.input_mix);
         }
 
+        self.timer.tick(&mut self.bus, 1);
+
         if self.cycles_until_next_step == 0 {
-            let step = self.cpu.step(&mut self.bus);
-            self.cycles_until_next_step = step.cycles.saturating_sub(1);
+            if let Some(cycles) = self.cpu.service_interrupt(&mut self.bus) {
+                self.cycles_until_next_step = cycles.saturating_sub(1);
+            } else {
+                let step = self.cpu.step(&mut self.bus);
+                self.cycles_until_next_step = step.cycles.saturating_sub(1);
+            }
         } else {
             self.cycles_until_next_step -= 1;
         }
@@ -172,5 +183,59 @@ mod tests {
         rom[0x147] = 0x00; // ROM only
         let digest = run_rom_digest(16, &replay, &rom).expect("rom run");
         assert_eq!(digest.system, SystemId::GbCgb);
+    }
+
+    #[test]
+    fn timer_interrupt_path_jumps_to_vector() {
+        let replay = ReplayLog::new();
+        let mut rom = vec![0; 0x8000];
+        rom[0x143] = 0x00;
+        rom[0x147] = 0x00;
+
+        // Main program at 0x100
+        let mut i = 0x100usize;
+        rom[i] = 0xF3; // DI
+        i += 1;
+        rom[i] = 0x3E; // LD A,04
+        rom[i + 1] = 0x04;
+        i += 2;
+        rom[i] = 0xEA; // LD (FFFF),A -> IE
+        rom[i + 1] = 0xFF;
+        rom[i + 2] = 0xFF;
+        i += 3;
+        rom[i] = 0x3E; // LD A,FE
+        rom[i + 1] = 0xFE;
+        i += 2;
+        rom[i] = 0xEA; // LD (FF05),A -> TIMA
+        rom[i + 1] = 0x05;
+        rom[i + 2] = 0xFF;
+        i += 3;
+        rom[i] = 0x3E; // LD A,80
+        rom[i + 1] = 0x80;
+        i += 2;
+        rom[i] = 0xEA; // LD (FF06),A -> TMA
+        rom[i + 1] = 0x06;
+        rom[i + 2] = 0xFF;
+        i += 3;
+        rom[i] = 0x3E; // LD A,05 (timer enable, freq 16)
+        rom[i + 1] = 0x05;
+        i += 2;
+        rom[i] = 0xEA; // LD (FF07),A -> TAC
+        rom[i + 1] = 0x07;
+        rom[i + 2] = 0xFF;
+        i += 3;
+        rom[i] = 0xFB; // EI
+        i += 1;
+        rom[i] = 0x76; // HALT
+
+        // Timer ISR at 0x50: LD A,99 ; RETI
+        rom[0x50] = 0x3E;
+        rom[0x51] = 0x99;
+        rom[0x52] = 0xD9;
+
+        let mut core = DmgCore::default();
+        core.load_rom(&rom).expect("rom load");
+        run_deterministic(&mut core, 512, &replay).expect("run");
+        assert_eq!(core.cpu_regs().a, 0x99);
     }
 }

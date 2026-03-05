@@ -2,6 +2,7 @@ use crate::cartridge::{CartridgeError, CartridgeInfo, GbCartridge};
 
 pub const RAM_SIZE: usize = 0x1_0000;
 pub const PROGRAM_START: u16 = 0x0100;
+const DIV_ADDR: u16 = 0xFF04;
 
 #[derive(Debug, Clone)]
 pub struct GbBus {
@@ -56,6 +57,14 @@ impl GbBus {
                 _ => {}
             }
         }
+        if addr == DIV_ADDR {
+            self.mem[DIV_ADDR as usize] = 0;
+            return;
+        }
+        self.mem[addr as usize] = value;
+    }
+
+    pub fn write8_raw(&mut self, addr: u16, value: u8) {
         self.mem[addr as usize] = value;
     }
 
