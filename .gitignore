@@ -1,0 +1,14 @@
+/target/
+
+# User-provided binaries and ROM assets for local testing only.
+/USER_SUPPLIED_ROMS/*
+!/USER_SUPPLIED_ROMS/.gitignore
+
+# Tool artifacts and local reports.
+/lab-output/
+
+# Editor + OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
