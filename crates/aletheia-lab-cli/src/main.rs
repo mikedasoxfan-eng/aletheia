@@ -74,6 +74,12 @@ enum Commands {
         max_cycles: Option<u64>,
         #[arg(long)]
         no_audio: bool,
+        #[arg(long)]
+        diagnostic_preview: bool,
+        #[arg(long)]
+        reference_exe: Option<PathBuf>,
+        #[arg(long = "reference-arg")]
+        reference_args: Vec<String>,
     },
     /// Run all supported ROM files in a directory tree and emit compatibility artifacts.
     Compat {
@@ -255,6 +261,8 @@ enum CliError {
     ReferenceProcessFailed { exe: String, code: i32 },
     #[error("reference emulator process timed out: {exe} after {timeout_ms}ms")]
     ReferenceProcessTimedOut { exe: String, timeout_ms: u64 },
+    #[error("built-in live playback is diagnostic-only; pass --reference-exe for playable video/audio or --diagnostic-preview for sample output")]
+    LivePlayableNotImplemented,
     #[error("live playback failed: {0}")]
     LivePlayback(String),
     #[error("diff mismatch for ROM '{rom}'")]
@@ -427,16 +435,25 @@ fn run() -> Result<(), CliError> {
             cycles_per_frame,
             max_cycles,
             no_audio,
+            diagnostic_preview,
+            reference_exe,
+            reference_args,
         } => {
-            let rom_image = load_rom_image(&rom)?;
-            run_live_playback(
-                rom_image,
-                fps,
-                sample_rate,
-                cycles_per_frame,
-                max_cycles,
-                no_audio,
-            )?;
+            if let Some(reference_exe) = reference_exe {
+                run_external_live_playback(&rom, reference_exe, reference_args)?;
+            } else if diagnostic_preview {
+                let rom_image = load_rom_image(&rom)?;
+                run_live_playback(
+                    rom_image,
+                    fps,
+                    sample_rate,
+                    cycles_per_frame,
+                    max_cycles,
+                    no_audio,
+                )?;
+            } else {
+                return Err(CliError::LivePlayableNotImplemented);
+            }
         }
         Commands::Compat {
             rom_dir,
@@ -676,7 +693,7 @@ fn run_live_playback(
 
     let mut window = Window::new(
         &format!(
-            "Aletheia Live [{}] - ESC quit, P pause",
+            "Aletheia Diagnostic Preview [{}] - ESC quit, P pause",
             profile.label.to_uppercase()
         ),
         profile.width,
@@ -764,7 +781,7 @@ fn run_live_playback(
         if title_update_counter >= fps {
             let pause_label = if paused { " (paused)" } else { "" };
             window.set_title(&format!(
-                "Aletheia Live [{}] cycles={} frames={}{}",
+                "Aletheia Diagnostic Preview [{}] cycles={} frames={}{}",
                 profile.label.to_uppercase(),
                 total_cycles,
                 frame_counter,
@@ -790,6 +807,33 @@ fn run_live_playback(
     }
 
     Ok(())
+}
+
+fn run_external_live_playback(
+    rom_path: &Path,
+    executable: PathBuf,
+    args: Vec<String>,
+) -> Result<(), CliError> {
+    let rendered_args = if args.is_empty() {
+        vec![rom_path.to_string_lossy().to_string()]
+    } else {
+        args.iter()
+            .map(|arg| {
+                arg.replace("{rom}", &rom_path.to_string_lossy())
+                    .replace("{rom_dir}", &rom_path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let status = Command::new(&executable).args(&rendered_args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::ReferenceProcessFailed {
+            exe: executable.to_string_lossy().to_string(),
+            code: status.code().unwrap_or(-1),
+        })
+    }
 }
 
 fn live_profile_for_format(format: RomFormat) -> Result<LiveProfile, CliError> {
