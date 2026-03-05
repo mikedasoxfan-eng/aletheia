@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aletheia-core = { path = "../aletheia-core" }
+aletheia-gb = { path = "../aletheia-gb" }
+aletheia-nes = { path = "../aletheia-nes" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
