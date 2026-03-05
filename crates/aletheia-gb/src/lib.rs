@@ -1,11 +1,29 @@
+mod bus;
+mod cpu;
+
+pub use bus::{GbBus, PROGRAM_START};
+pub use cpu::{GbCpu, Registers, StepInfo};
+
 use aletheia_core::{
     DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
     run_deterministic,
 };
 
+const BOOT_PROGRAM: [u8; 9] = [0x3E, 0x10, 0x3C, 0x3D, 0xAF, 0x3E, 0x42, 0x00, 0x00];
+const JOYPAD_REG: u16 = 0xFF00;
+
 #[derive(Debug, Default)]
 pub struct DmgCore {
-    cpu_mix: u32,
+    cpu: GbCpu,
+    bus: GbBus,
+    cycles_until_next_step: u8,
+    input_mix: u8,
+}
+
+impl DmgCore {
+    pub fn cpu_regs(&self) -> Registers {
+        self.cpu.regs()
+    }
 }
 
 impl DeterministicMachine for DmgCore {
@@ -14,20 +32,32 @@ impl DeterministicMachine for DmgCore {
     }
 
     fn reset(&mut self) {
-        self.cpu_mix = 0x01D0_3F21;
+        self.bus.clear();
+        self.bus.load_program(PROGRAM_START, &BOOT_PROGRAM);
+        self.cpu.reset();
+        self.cycles_until_next_step = 0;
+        self.input_mix = 0;
     }
 
     fn tick(&mut self, cycle: u64, input_events: &[InputEvent]) -> (u8, i16) {
         for event in input_events {
-            self.cpu_mix = self.cpu_mix.rotate_left(5)
-                ^ ((event.port as u32) << 24)
-                ^ ((event.button as u32) << 8)
-                ^ ((event.state as u32) << 16)
-                ^ (cycle as u32);
+            let mix = (event.button as u8) << 1 | (event.state as u8);
+            self.input_mix = self.input_mix.rotate_left(1) ^ mix ^ event.port;
+            self.bus.write8(JOYPAD_REG, self.input_mix);
         }
 
-        let frame = self.cpu_mix.wrapping_add(cycle as u32) as u8;
-        let audio = ((self.cpu_mix ^ 0x9E37_79B9).wrapping_add(cycle as u32) & 0x7FFF) as i16;
+        if self.cycles_until_next_step == 0 {
+            let step = self.cpu.step(&mut self.bus);
+            self.cycles_until_next_step = step.cycles.saturating_sub(1);
+        } else {
+            self.cycles_until_next_step -= 1;
+        }
+
+        let regs = self.cpu.regs();
+        let frame = regs.a ^ regs.f ^ self.input_mix ^ (cycle as u8);
+        let audio = (((regs.pc as i32) << 2)
+            ^ ((self.cycles_until_next_step as i32) << 7)
+            ^ ((self.input_mix as i32) << 10)) as i16;
         (frame, audio)
     }
 }
@@ -73,5 +103,14 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.system, SystemId::GbDmg);
         assert_eq!(first.applied_events, 3);
+    }
+
+    #[test]
+    fn cpu_executes_boot_program_deterministically() {
+        let replay = replay_fixture();
+        let mut core = DmgCore::default();
+        run_deterministic(&mut core, 40, &replay).expect("run should succeed");
+        let regs = core.cpu_regs();
+        assert_eq!(regs.a, 0x42);
     }
 }
