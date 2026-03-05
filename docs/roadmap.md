@@ -38,6 +38,17 @@
   - `aletheia-gba` bootstrap deterministic core.
   - `aletheia-lab-cli run-rom` command.
 
+## Slice 2C: Expanded Decode + Mapper/Timer Foundations
+- Acceptance criteria:
+  - GB core executes broader control-flow/stack/ALU subset and services timer IRQs.
+  - NES core supports strict unsupported-op errors and MMC1 PRG banking.
+  - GBA core executes a broader ARM/THUMB subset and fails fast on unsupported instructions.
+  - `cargo test --workspace` remains green.
+- Artifacts:
+  - GB timer/interrupt module and expanded CPU tests.
+  - NES MMC1 mapper logic and expanded CPU tests.
+  - GBA ARM/THUMB decoder expansion and fault-path tests.
+
 ## Slice 3: First Real CPU Verticals
 - Acceptance criteria:
   - GB CPU executes a small instruction subset with flag-accurate unit tests.

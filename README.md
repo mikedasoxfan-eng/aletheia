@@ -26,6 +26,10 @@ Implemented today:
 - Minimal executable CPU verticals:
   - GB: `NOP`, `LD A,d8`, `INC A`, `DEC A`, `XOR A`.
   - NES: `NOP`, `LDA #imm`, `TAX`, `INX`, `DEX`.
+- Expanded CPU/timing coverage:
+  - GB: broader control-flow/ALU/load-store subset (`JP/JR/CALL/RET/RETI`, `ADD/CP`, `LD r,d8`, `LD (nn),A`, `LD A,(nn)`, `DI/EI/HALT`) plus basic timer + interrupt request handling.
+  - NES: broader official opcode subset (`LDA/LDX/LDY`, `STA/STX/STY`, `ADC/SBC`, `CMP/CPX/CPY`, `JSR/RTS`, `JMP`, `BNE/BEQ`, `CLC/SEC`, `AND/ORA/EOR`) with strict unsupported-op errors.
+  - GBA: broader ARM/THUMB bootstrap decode path with strict unsupported-op errors (fails fast instead of silent no-op).
 - Headless lab CLI:
   - `smoke` command for single-system JSON output.
   - `suite` command for multi-system `summary.json` + `summary.html`.
@@ -50,6 +54,7 @@ Artifacts produced:
 
 Not implemented yet:
 - Full CPU coverage and cycle-accurate timing behavior.
-- PPU/APU, interrupts, timers, DMA, mappers/MBCs.
+- PPU/APU/DMA fidelity and full interrupt/timer edge-case coverage.
+- Full mapper/MBC coverage (MMC1/NROM and MBC1 scaffolds are present; MBC3 RTC, MBC5, and additional NES mappers are pending).
 - Save-state schema and deterministic replay checkpoints.
 - Differential harness against external reference emulators.
