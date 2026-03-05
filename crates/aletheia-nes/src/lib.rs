@@ -1,11 +1,29 @@
+mod bus;
+mod cpu;
+
+pub use bus::{NesBus, PROGRAM_START, RESET_VECTOR};
+pub use cpu::{NesCpu, Registers, StepInfo};
+
 use aletheia_core::{
     DeterminismError, DeterministicMachine, InputEvent, ReplayLog, RunDigest, SystemId,
     run_deterministic,
 };
 
+const BOOT_PROGRAM: [u8; 7] = [0xA9, 0x11, 0xAA, 0xE8, 0xCA, 0xEA, 0xEA];
+const CONTROLLER_PORT: u16 = 0x4016;
+
 #[derive(Debug, Default)]
 pub struct NesCore {
-    bus_mix: u32,
+    cpu: NesCpu,
+    bus: NesBus,
+    cycles_until_next_step: u8,
+    input_mix: u8,
+}
+
+impl NesCore {
+    pub fn cpu_regs(&self) -> Registers {
+        self.cpu.regs()
+    }
 }
 
 impl DeterministicMachine for NesCore {
@@ -14,21 +32,33 @@ impl DeterministicMachine for NesCore {
     }
 
     fn reset(&mut self) {
-        self.bus_mix = 0x8161_53D1;
+        self.bus.clear();
+        self.bus.load_program(PROGRAM_START, &BOOT_PROGRAM);
+        self.bus.set_reset_vector(PROGRAM_START);
+        self.cpu.reset(&self.bus);
+        self.cycles_until_next_step = 0;
+        self.input_mix = 0;
     }
 
     fn tick(&mut self, cycle: u64, input_events: &[InputEvent]) -> (u8, i16) {
         for event in input_events {
-            self.bus_mix = self.bus_mix.rotate_right(3)
-                ^ ((event.port as u32) << 20)
-                ^ ((event.button as u32) << 10)
-                ^ ((event.state as u32) << 16)
-                ^ (!cycle as u32);
+            let mix = (event.button as u8) << 1 | (event.state as u8);
+            self.input_mix = self.input_mix.rotate_right(1) ^ mix ^ event.port;
+            self.bus.write8(CONTROLLER_PORT, self.input_mix);
         }
 
-        let frame = self.bus_mix.wrapping_mul(17).wrapping_add(cycle as u32) as u8;
-        let audio =
-            ((self.bus_mix ^ 0x7F4A_7C15).wrapping_add((cycle as u32) << 1) & 0x7FFF) as i16;
+        if self.cycles_until_next_step == 0 {
+            let step = self.cpu.step(&mut self.bus);
+            self.cycles_until_next_step = step.cycles.saturating_sub(1);
+        } else {
+            self.cycles_until_next_step -= 1;
+        }
+
+        let regs = self.cpu.regs();
+        let frame = regs.a ^ regs.x ^ regs.p ^ self.input_mix ^ (cycle as u8);
+        let audio = (((regs.pc as i32) << 2)
+            ^ ((self.cycles_until_next_step as i32) << 8)
+            ^ ((self.input_mix as i32) << 10)) as i16;
         (frame, audio)
     }
 }
@@ -74,5 +104,15 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.system, SystemId::Nes);
         assert_eq!(first.applied_events, 3);
+    }
+
+    #[test]
+    fn cpu_executes_boot_program_deterministically() {
+        let replay = replay_fixture();
+        let mut core = NesCore::default();
+        run_deterministic(&mut core, 16, &replay).expect("run should succeed");
+        let regs = core.cpu_regs();
+        assert_eq!(regs.a, 0x11);
+        assert_eq!(regs.x, 0x11);
     }
 }
